@@ -1,0 +1,179 @@
+import serial
+import time
+import pigpio
+import RPi.GPIO as GPIO
+import threading
+import sys
+
+SERIAL_PORT = '/dev/ttyUSB0'
+BAUDRATE = 115200
+
+SERVO_PINS = [17, 18, 19, 20, 21]
+BUTTON_PIN = 4
+
+OPEN_ANGLE = 0
+CLOSE_ANGLE = 90
+STEP_DEG = 3
+STEP_DELAY = 0.04
+THRESHOLDS = [500, 500, 500, 500, 500]
+TEMP_ABORT = 30.0
+
+def angle_to_pulse(a):
+    a = max(0.0, min(180.0, a))
+    return int(500 + (2500 - 500) * (a / 180.0))
+
+class SimpleServoController:
+    def __init__(self, pi, pins):
+        self.pi = pi
+        self.pins = list(pins)
+        self.current = {p: OPEN_ANGLE for p in self.pins}
+        for p in self.pins:
+            self.pi.set_servo_pulsewidth(p, angle_to_pulse(OPEN_ANGLE))
+        time.sleep(0.1)
+
+    def move_to_angle_by_pin(self, pin, angle):
+        self.current[pin] = angle
+        self.pi.set_servo_pulsewidth(pin, angle_to_pulse(angle))
+
+    def open_all(self):
+        for p in self.pins:
+            self.move_to_angle_by_pin(p, OPEN_ANGLE)
+
+    def stop_all(self):
+        for p in self.pins:
+            self.pi.set_servo_pulsewidth(p, 0)
+
+    def cleanup(self):
+        self.open_all()
+        time.sleep(0.2)
+        self.stop_all()
+
+latest_lock = threading.Lock()
+latest = {'fsr': [0,0,0,0,0], 'temp': 0.0, 'last_ts': None}
+stop_flag = threading.Event()
+
+def serial_thread_fn(port, baud):
+    global latest
+    while not stop_flag.is_set():
+        try:
+            with serial.Serial(port, baud, timeout=1) as ser:
+                time.sleep(1.0)
+                ser.reset_input_buffer()
+                while not stop_flag.is_set():
+                    raw = ser.readline()
+                    if not raw:
+                        continue
+                    line = raw.decode('ascii', errors='ignore').strip()
+                    if not line:
+                        continue
+                    parts = [p.strip() for p in line.split(',') if p.strip()!='']
+                    if len(parts) >= 6:
+                        try:
+                            fsrs = [int(float(parts[i])) for i in range(5)]
+                            temp = float(parts[5])
+                            with latest_lock:
+                                latest['fsr'] = fsrs
+                                latest['temp'] = temp
+                                latest['last_ts'] = time.time()
+                        except:
+                            pass
+        except Exception as e:
+            print("Serial error:", e)
+            time.sleep(2)
+
+state_lock = threading.Lock()
+state = 'idle'
+
+def button_callback(channel):
+    global state
+    with state_lock:
+        if state == 'idle':
+            print("Button pressed -> closing")
+            state = 'closing'
+        elif state == 'closing':
+            print("Button pressed -> open")
+            state = 'idle'
+        elif state == 'gripped':
+            print("Button pressed -> open")
+            state = 'idle'
+
+def run_actuation(pi, servo_ctrl):
+    global state
+    pins = servo_ctrl.pins
+    cur_angle = {p: OPEN_ANGLE for p in pins}
+    try:
+        while not stop_flag.is_set():
+            with state_lock:
+                s = state
+            if s == 'idle':
+                servo_ctrl.open_all()
+                time.sleep(0.2)
+                continue
+            if s == 'closing':
+                reached = {p: False for p in pins}
+                for p in pins:
+                    cur_angle[p] = OPEN_ANGLE
+                    servo_ctrl.move_to_angle_by_pin(p, OPEN_ANGLE)
+                while not all(reached.values()) and state == 'closing' and not stop_flag.is_set():
+                    with latest_lock:
+                        temp = latest['temp']
+                        fsr_vals = list(latest['fsr'])
+                    if temp >= TEMP_ABORT:
+                        print("Temp high:", temp)
+                        with state_lock:
+                            state = 'idle'
+                        servo_ctrl.open_all()
+                        break
+                    for idx, p in enumerate(pins):
+                        if reached[p]:
+                            continue
+                        val = fsr_vals[idx]
+                        if val >= THRESHOLDS[idx]:
+                            reached[p] = True
+                            print(f"Finger {idx} stop, val={val}")
+                            continue
+                        if cur_angle[p] < CLOSE_ANGLE:
+                            cur_angle[p] = min(CLOSE_ANGLE, cur_angle[p] + STEP_DEG)
+                            servo_ctrl.move_to_angle_by_pin(p, cur_angle[p])
+                    time.sleep(STEP_DELAY)
+                with state_lock:
+                    if state == 'closing':
+                        state = 'gripped'
+                        print("Grip done")
+            elif s == 'gripped':
+                time.sleep(0.1)
+            else:
+                time.sleep(0.1)
+    except Exception as e:
+        print("Actuation error:", e)
+
+def main():
+    th = threading.Thread(target=serial_thread_fn, args=(SERIAL_PORT, BAUDRATE), daemon=True)
+    th.start()
+    print("Serial reader started")
+
+    pi = pigpio.pi()
+    if not pi.connected:
+        print("pigpio not running!")
+        stop_flag.set()
+        return
+
+    servo_ctrl = SimpleServoController(pi, SERVO_PINS)
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.add_event_detect(BUTTON_PIN, GPIO.FALLING, callback=button_callback, bouncetime=250)
+    print("Button ready")
+
+    try:
+        run_actuation(pi, servo_ctrl)
+    except KeyboardInterrupt:
+        print("Keyboard interrupt")
+    finally:
+        stop_flag.set()
+        GPIO.cleanup()
+        servo_ctrl.cleanup()
+        pi.stop()
+        print("Exit clean")
+
+if __name__ == "__main__":
+    main()
