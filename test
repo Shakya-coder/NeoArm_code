@@ -1,163 +1,252 @@
+#!/usr/bin/env python3
 """
-vision_controller.py — NeoArm Vision (with live preview + detection boxes)
+vision_controller.py
 
-✅ Detects real-world objects using YOLOv8
-✅ Categorizes into soft/hard/unknown
-✅ Displays live camera preview with bounding boxes and labels
-✅ Sends detection events via callback (same logic retained)
-
-To run:
-    cd ~/NeoArm
-    source .venv/bin/activate
+- Uses libcamera via GStreamer (default) to capture frames on Raspberry Pi OS.
+- Loads YOLOv8 model (auto-download if necessary).
+- Draws bounding boxes, labels, FPS on preview.
+- Classifies objects into soft/hard/unknown and prints events.
+- Usage:
     python3 vision/vision_controller.py
-Press 'q' to quit.
+    python3 vision/vision_controller.py --source tcp://127.0.0.1:8554
 """
 
-import os
+import argparse
 import time
 import threading
 from pathlib import Path
+import shutil
+import sys
+
 import cv2
 import numpy as np
 from ultralytics import YOLO
 
-# ----------------------------------------------------
+# -----------------------
 # Config
-# ----------------------------------------------------
+# -----------------------
 ROOT = Path.home() / "NeoArm"
 VISION_DIR = ROOT / "vision"
 MODELS_DIR = VISION_DIR / "models"
 MODEL_FILENAME = "yolov8n.pt"
 MODEL_PATH = MODELS_DIR / MODEL_FILENAME
 
-THRESHOLDS = {
-    "soft": {"conf": 0.25, "score": 0.10},
-    "hard": {"conf": 0.25, "score": 0.10},
-    "unknown": {"conf": 0.25, "score": 0.10},
-}
+# thresholds (example)
+THRESHOLDS = {"soft": 0.25, "hard": 0.35, "unknown": 0.20}
 
+# class -> category hints (extend as needed)
 CLASS_TO_CATEGORY = {
-    "bottle": "hard", "cup": "hard", "cell phone": "hard",
-    "laptop": "hard", "remote": "hard", "keyboard": "hard",
-    "sports ball": "hard", "baseball": "hard", "tennis racket": "hard",
-    "apple": "soft", "banana": "soft", "orange": "soft",
-    "sandwich": "soft", "cake": "soft", "donut": "soft",
-    "hand": "unknown", "person": "unknown"
+    "bottle": "hard", "cup": "hard", "cell phone": "hard", "phone": "hard",
+    "laptop": "hard", "keyboard": "hard", "remote": "hard",
+    "sports ball": "hard", "baseball": "hard", "tennis ball": "hard",
+    "apple": "soft", "banana": "soft", "orange": "soft", "sandwich": "soft",
+    "cake": "soft", "donut": "soft", "hand": "unknown", "person": "unknown"
 }
 
-def get_class_category(name: str) -> str:
-    name = (name or "").lower()
-    if name in CLASS_TO_CATEGORY:
-        return CLASS_TO_CATEGORY[name]
-    if any(f in name for f in ("apple", "banana", "fruit", "mango")):
+def get_category(name: str) -> str:
+    if not name:
+        return "unknown"
+    n = name.lower()
+    if n in CLASS_TO_CATEGORY:
+        return CLASS_TO_CATEGORY[n]
+    if any(f in n for f in ("apple","banana","orange","fruit","mango","pear")):
         return "soft"
-    if any(f in name for f in ("bottle", "phone", "laptop", "remote", "cup")):
+    if any(f in n for f in ("phone","bottle","cup","laptop","remote","keyboard","mouse")):
         return "hard"
-    if "person" in name or "hand" in name:
+    if "hand" in n or "person" in n:
         return "unknown"
     return "unknown"
 
+# -----------------------
+# Model helper
+# -----------------------
+def ensure_model_available():
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    if Path(MODEL_PATH).exists():
+        return
+    print("[vision] Model not found locally — downloading yolov8n.pt (ultralytics cache)...")
+    # this will cause ultralytics to download into its cache, then we copy
+    tmp = YOLO("yolov8n.pt")  # will download if needed
+    # try to locate checkpoint path
+    possible = []
+    # ultralytics model object may have attributes with path
+    for attr in ("ckpt_path", "best", "device"):
+        if hasattr(tmp, attr):
+            possible.append(getattr(tmp, attr))
+    # fallback to working directory file
+    if Path("yolov8n.pt").exists():
+        possible.append("yolov8n.pt")
+    # choose first existing path
+    src = None
+    for p in possible:
+        if p and Path(p).exists():
+            src = Path(p)
+            break
+    # ultralytics also stores model.cache in ~/.cache/ultralytics/...
+    if src is None:
+        cache_path = Path.home() / ".cache" / "ultralytics"
+        if cache_path.exists():
+            for child in cache_path.rglob("yolov8n*.pt"):
+                src = child
+                break
+    if src is None:
+        raise RuntimeError("Could not find downloaded model file; ensure internet and rerun.")
+    shutil.copy(src, MODEL_PATH)
+    print(f"[vision] Model copied to {MODEL_PATH}")
 
-# ----------------------------------------------------
-# VisionController class
-# ----------------------------------------------------
-class VisionController:
-    def __init__(self):
-        MODELS_DIR.mkdir(parents=True, exist_ok=True)
-        self.model = YOLO(str(MODEL_PATH))  # auto-downloads if missing
-        self.cap = None
-        self.running = False
-        self.callbacks = []
-        self.thread = None
-        print("[vision] Model loaded successfully from:", MODEL_PATH)
+# -----------------------
+# Video capture helpers
+# -----------------------
+def gst_camera_pipeline(width=640, height=480, framerate=30):
+    # libcamerasrc pipeline (works with rpicam-apps/libcamera)
+    return (
+        f"libcamerasrc ! "
+        f"video/x-raw,width={width},height={height},framerate={framerate}/1 ! "
+        f"videoconvert ! appsink"
+    )
 
-    def register_callback(self, fn):
-        if callable(fn):
-            self.callbacks.append(fn)
+def open_capture(source: str, width=640, height=480, framerate=30):
+    """
+    source: None (use libcamera gst pipeline), or "tcp://ip:port" (use network), or "/dev/video0"
+    """
+    if source is None:
+        pipeline = gst_camera_pipeline(width, height, framerate)
+        cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+        if cap is None or not cap.isOpened():
+            # try fallback to default device
+            cap = cv2.VideoCapture(0)
+    else:
+        # use provided source (e.g., tcp://127.0.0.1:8554)
+        cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG) if source.startswith("tcp://") else cv2.VideoCapture(source)
+    # set properties where possible
+    try:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        cap.set(cv2.CAP_PROP_FPS, framerate)
+    except Exception:
+        pass
+    return cap
 
-    def start(self):
-        if self.running:
-            return
-        self.cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        time.sleep(0.2)
-        if not self.cap.isOpened():
-            raise RuntimeError("❌ Camera could not be opened.")
-        self.running = True
-        self.thread = threading.Thread(target=self._loop, daemon=True)
-        self.thread.start()
-        print("[vision] Camera started. Showing live preview. Press 'q' to quit.")
+# -----------------------
+# Drawing utils
+# -----------------------
+def draw_label(img, text, topleft, bg_color=(0,0,0), text_color=(255,255,255)):
+    x, y = topleft
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.5
+    t_size = cv2.getTextSize(text, font, scale, 1)[0]
+    cv2.rectangle(img, (x, y - t_size[1] - 6), (x + t_size[0] + 6, y + 2), bg_color, -1)
+    cv2.putText(img, text, (x + 3, y - 3), font, scale, text_color, 1, cv2.LINE_AA)
 
-    def stop(self):
-        self.running = False
-        if self.thread:
-            self.thread.join()
-        if self.cap:
-            self.cap.release()
-        cv2.destroyAllWindows()
-        print("[vision] Camera stopped.")
+# -----------------------
+# Main controller
+# -----------------------
+def run(source_arg: str = None):
+    ensure_model_available()
+    print("[vision] Loading model...")
+    model = YOLO(str(MODEL_PATH))
+    names = getattr(model.model, "names", {})
+    print("[vision] Model loaded. Classes sample:", list(names.items())[:8])
 
-    def _loop(self):
-        while self.running:
-            ret, frame = self.cap.read()
-            if not ret:
+    # open capture
+    print("[vision] Opening capture (this may take a moment)...")
+    cap = open_capture(source_arg, width=640, height=480, framerate=30)
+    time.sleep(0.2)
+    if cap is None or not cap.isOpened():
+        print("[vision] ERROR: camera capture could not be opened. If you are streaming with rpicam-vid, use --source tcp://<IP>:PORT")
+        return
+
+    print("[vision] Capture opened. Starting detection. Press 'q' to quit.")
+    prev = time.time()
+    fps_smooth = 0.0
+
+    try:
+        while True:
+            t0 = time.time()
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                # sometimes pipeline needs a small sleep to stabilize
+                time.sleep(0.05)
+                # print once per second if failing
+                if time.time() - prev > 1.0:
+                    print("[vision] WARN: frame not received yet...")
+                    prev = time.time()
                 continue
 
-            # Run inference
-            results = self.model.predict(frame, imgsz=640, conf=0.25, verbose=False)
-            if not results:
-                continue
+            # optional resize for faster inference (model will accept this)
+            h, w = frame.shape[:2]
+            # predict (use img input directly)
+            results = model.predict(source=[frame], imgsz=max(w, h), conf=0.25, max_det=10, verbose=False)
+            # compute fps
+            dt = time.time() - t0
+            fps = 1.0 / dt if dt > 0 else 0.0
+            fps_smooth = fps_smooth * 0.85 + fps * 0.15
 
-            r = results[0]
-            boxes = getattr(r, "boxes", [])
-            for box in boxes:
-                try:
-                    conf = float(box.conf[0]) if hasattr(box.conf, "__len__") else float(box.conf)
-                except Exception:
-                    conf = 0.0
-                cls_idx = int(box.cls[0]) if hasattr(box.cls, "__len__") else int(box.cls)
-                name = self.model.model.names.get(cls_idx, str(cls_idx))
-                category = get_class_category(name)
-                (x1, y1, x2, y2) = map(int, box.xyxy[0])
+            # annotate detections
+            if results and len(results) > 0:
+                r = results[0]
+                boxes = getattr(r, "boxes", [])
+                for b in boxes:
+                    # get conf, cls, xyxy safely
+                    try:
+                        conf = float(b.conf[0]) if hasattr(b.conf, "__len__") else float(b.conf)
+                    except:
+                        conf = float(getattr(b, "conf", 0.0))
+                    try:
+                        cls_i = int(b.cls[0]) if hasattr(b.cls, "__len__") else int(b.cls)
+                    except:
+                        cls_i = int(getattr(b, "cls", 0))
+                    cls_name = names.get(cls_i, str(cls_i))
+                    try:
+                        xy = b.xyxy[0].cpu().numpy() if hasattr(b.xyxy[0], "cpu") else b.xyxy[0]
+                        x1, y1, x2, y2 = [int(float(v)) for v in xy]
+                    except Exception:
+                        try:
+                            x1, y1, x2, y2 = [int(float(v)) for v in b.xyxy]
+                        except Exception:
+                            x1 = y1 = x2 = y2 = 0
 
-                # Color by category
-                color = (0, 255, 0) if category == "soft" else (0, 0, 255) if category == "hard" else (255, 255, 0)
-                label = f"{name} ({conf*100:.1f}%)"
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(frame, label, (x1, y1 - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    # category
+                    category = get_category(cls_name)
+                    threshold = THRESHOLDS.get(category, 0.3)
+                    # color
+                    color = (0, 255, 0) if category == "soft" else (0, 0, 255) if category == "hard" else (0, 255, 255)
 
-                # Event dictionary
-                event = {
-                    "class": name,
-                    "confidence": round(conf, 3),
-                    "category": category,
-                    "bbox": [x1, y1, x2, y2],
-                    "stop_recommendation": conf >= THRESHOLDS[category]["conf"]
-                }
-                for cb in self.callbacks:
-                    cb(event)
+                    # draw box + label
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    lbl = f"{cls_name} {conf*100:.1f}%"
+                    draw_label(frame, lbl, (x1, y1), bg_color=color, text_color=(0,0,0))
+                    draw_label(frame, f"{category.upper()} Th={threshold}", (x1, y2 + 18), bg_color=(10,10,10), text_color=(255,255,255))
 
-            # Show preview
+                    # print event
+                    print(f"[vision event] {cls_name} conf={conf:.3f} category={category} threshold={threshold}")
+
+            # overlay FPS
+            draw_label(frame, f"FPS {fps_smooth:.1f}", (10, 20), bg_color=(10,10,10), text_color=(255,255,255))
+
+            # show
             cv2.imshow("NeoArm Vision", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                self.stop()
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
                 break
 
-
-# ----------------------------------------------------
-# Example run
-# ----------------------------------------------------
-def print_event(e):
-    print("[Detected]", e)
-
-if __name__ == "__main__":
-    vc = VisionController()
-    vc.register_callback(print_event)
-    try:
-        vc.start()
-        while vc.running:
-            time.sleep(0.5)
     except KeyboardInterrupt:
-        vc.stop()
+        print("[vision] Interrupted by user")
+    finally:
+        try:
+            cap.release()
+        except Exception:
+            pass
+        cv2.destroyAllWindows()
+        print("[vision] Exited cleanly.")
+
+# -----------------------
+# CLI
+# -----------------------
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--source", "-s", default=None,
+                   help="Capture source. None => libcamera(gst). Example to read stream tcp://127.0.0.1:8554")
+    args = p.parse_args()
+    run(args.source)
+
