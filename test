@@ -1,15 +1,163 @@
-import cv2, sys, time
-cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-time.sleep(0.2)
-if not cap.isOpened():
-    print("CAM_OPEN_FAILED"); sys.exit(1)
-ret, frame = cap.read()
-if not ret:
-    print("FRAME_READ_FAILED"); sys.exit(1)
-print("FRAME_OK shape:", frame.shape, "dtype:", frame.dtype)
-cv2.imwrite("vision/debug_frame.jpg", frame)
-print("Saved vision/debug_frame.jpg — open it on the Pi or transfer to your PC to inspect.")
-cap.release()
-PY
+"""
+vision_controller.py — NeoArm Vision (with live preview + detection boxes)
+
+✅ Detects real-world objects using YOLOv8
+✅ Categorizes into soft/hard/unknown
+✅ Displays live camera preview with bounding boxes and labels
+✅ Sends detection events via callback (same logic retained)
+
+To run:
+    cd ~/NeoArm
+    source .venv/bin/activate
+    python3 vision/vision_controller.py
+Press 'q' to quit.
+"""
+
+import os
+import time
+import threading
+from pathlib import Path
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+# ----------------------------------------------------
+# Config
+# ----------------------------------------------------
+ROOT = Path.home() / "NeoArm"
+VISION_DIR = ROOT / "vision"
+MODELS_DIR = VISION_DIR / "models"
+MODEL_FILENAME = "yolov8n.pt"
+MODEL_PATH = MODELS_DIR / MODEL_FILENAME
+
+THRESHOLDS = {
+    "soft": {"conf": 0.25, "score": 0.10},
+    "hard": {"conf": 0.25, "score": 0.10},
+    "unknown": {"conf": 0.25, "score": 0.10},
+}
+
+CLASS_TO_CATEGORY = {
+    "bottle": "hard", "cup": "hard", "cell phone": "hard",
+    "laptop": "hard", "remote": "hard", "keyboard": "hard",
+    "sports ball": "hard", "baseball": "hard", "tennis racket": "hard",
+    "apple": "soft", "banana": "soft", "orange": "soft",
+    "sandwich": "soft", "cake": "soft", "donut": "soft",
+    "hand": "unknown", "person": "unknown"
+}
+
+def get_class_category(name: str) -> str:
+    name = (name or "").lower()
+    if name in CLASS_TO_CATEGORY:
+        return CLASS_TO_CATEGORY[name]
+    if any(f in name for f in ("apple", "banana", "fruit", "mango")):
+        return "soft"
+    if any(f in name for f in ("bottle", "phone", "laptop", "remote", "cup")):
+        return "hard"
+    if "person" in name or "hand" in name:
+        return "unknown"
+    return "unknown"
+
+
+# ----------------------------------------------------
+# VisionController class
+# ----------------------------------------------------
+class VisionController:
+    def __init__(self):
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        self.model = YOLO(str(MODEL_PATH))  # auto-downloads if missing
+        self.cap = None
+        self.running = False
+        self.callbacks = []
+        self.thread = None
+        print("[vision] Model loaded successfully from:", MODEL_PATH)
+
+    def register_callback(self, fn):
+        if callable(fn):
+            self.callbacks.append(fn)
+
+    def start(self):
+        if self.running:
+            return
+        self.cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        time.sleep(0.2)
+        if not self.cap.isOpened():
+            raise RuntimeError("❌ Camera could not be opened.")
+        self.running = True
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+        print("[vision] Camera started. Showing live preview. Press 'q' to quit.")
+
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join()
+        if self.cap:
+            self.cap.release()
+        cv2.destroyAllWindows()
+        print("[vision] Camera stopped.")
+
+    def _loop(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            if not ret:
+                continue
+
+            # Run inference
+            results = self.model.predict(frame, imgsz=640, conf=0.25, verbose=False)
+            if not results:
+                continue
+
+            r = results[0]
+            boxes = getattr(r, "boxes", [])
+            for box in boxes:
+                try:
+                    conf = float(box.conf[0]) if hasattr(box.conf, "__len__") else float(box.conf)
+                except Exception:
+                    conf = 0.0
+                cls_idx = int(box.cls[0]) if hasattr(box.cls, "__len__") else int(box.cls)
+                name = self.model.model.names.get(cls_idx, str(cls_idx))
+                category = get_class_category(name)
+                (x1, y1, x2, y2) = map(int, box.xyxy[0])
+
+                # Color by category
+                color = (0, 255, 0) if category == "soft" else (0, 0, 255) if category == "hard" else (255, 255, 0)
+                label = f"{name} ({conf*100:.1f}%)"
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(frame, label, (x1, y1 - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+                # Event dictionary
+                event = {
+                    "class": name,
+                    "confidence": round(conf, 3),
+                    "category": category,
+                    "bbox": [x1, y1, x2, y2],
+                    "stop_recommendation": conf >= THRESHOLDS[category]["conf"]
+                }
+                for cb in self.callbacks:
+                    cb(event)
+
+            # Show preview
+            cv2.imshow("NeoArm Vision", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                self.stop()
+                break
+
+
+# ----------------------------------------------------
+# Example run
+# ----------------------------------------------------
+def print_event(e):
+    print("[Detected]", e)
+
+if __name__ == "__main__":
+    vc = VisionController()
+    vc.register_callback(print_event)
+    try:
+        vc.start()
+        while vc.running:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        vc.stop()
