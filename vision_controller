@@ -1,0 +1,358 @@
+"""
+vision_controller.py
+
+VisionController for NeoArm:
+- Uses OpenCV capture (device 0)
+- Loads YOLO model (auto-downloads yolov8n.pt if missing)
+- Classifies detected objects into soft/hard/unknown
+- Computes score = confidence * bbox_area_norm and issues stop recommendation
+- Runs in background thread and calls registered callbacks with event dicts
+
+Install requirements inside your venv:
+    pip install ultralytics opencv-python-headless numpy
+
+Run example:
+    cd ~/NeoArm
+    source .venv/bin/activate
+    python3 vision/vision_controller.py
+"""
+
+import os
+import time
+import threading
+import shutil
+from pathlib import Path
+from collections import deque
+
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+
+# --------------------
+# Config
+# --------------------
+ROOT = Path.home() / "NeoArm"
+VISION_DIR = ROOT / "vision"
+MODELS_DIR = VISION_DIR / "models"
+MODEL_FILENAME = "yolov8n.pt"
+MODEL_PATH = MODELS_DIR / MODEL_FILENAME
+
+# thresholds by category (you can change these)
+THRESHOLDS = {
+    "soft": {"conf": 0.30, "score": 0.25},
+    "hard": {"conf": 0.40, "score": 0.45},
+    "unknown": {"conf": 0.20, "score": 0.20},
+}
+
+# frame and inference settings
+CAP_DEVICE = 0
+FRAME_W = 640
+FRAME_H = 480
+INFERENCE_EVERY_N_FRAMES = 1  # run inference every N frames to reduce load
+MAX_DETECTIONS = 8
+
+
+# --------------------
+# Utility: class -> category mapping
+# --------------------
+CLASS_TO_CATEGORY = {
+    # common COCO names mapped
+    "bottle": "hard",
+    "cup": "hard",
+    "cell phone": "hard",
+    "phone": "hard",
+    "mobile phone": "hard",
+    "laptop": "hard",
+    "remote": "hard",
+    "keyboard": "hard",
+    "baseball": "hard",
+    "sports ball": "hard",  # cricket ball
+    "tennis racket": "hard",
+    "apple": "soft",
+    "banana": "soft",
+    "orange": "soft",
+    "sandwich": "soft",
+    "cake": "soft",
+    "donut": "soft",
+    "hand": "unknown",
+    "person": "unknown",
+    # add more as needed
+}
+
+
+def get_class_category(name: str) -> str:
+    if not name:
+        return "unknown"
+    k = name.lower()
+    if name in CLASS_TO_CATEGORY:
+        return CLASS_TO_CATEGORY[name]
+    if k in CLASS_TO_CATEGORY:
+        return CLASS_TO_CATEGORY[k]
+    # heuristics
+    if any(f in k for f in ("apple", "banana", "orange", "mango", "pear", "grape")):
+        return "soft"
+    if any(h in k for h in ("phone", "mobile", "bottle", "cup", "laptop", "keyboard", "remote")):
+        return "hard"
+    if "ball" in k or "cricket" in k or "bat" in k:
+        return "hard"
+    if "hand" in k or "person" in k:
+        return "unknown"
+    return "unknown"
+
+
+# --------------------
+# VisionController
+# --------------------
+class VisionController:
+    def __init__(self,
+                 model_path: str = str(MODEL_PATH),
+                 cap_device: int = CAP_DEVICE,
+                 frame_w: int = FRAME_W,
+                 frame_h: int = FRAME_H,
+                 infer_every_n: int = INFERENCE_EVERY_N_FRAMES,
+                 thresholds: dict = THRESHOLDS):
+        self.model_path = Path(model_path)
+        self.cap_device = cap_device
+        self.frame_w = frame_w
+        self.frame_h = frame_h
+        self.infer_every_n = max(1, infer_every_n)
+        self.thresholds = thresholds
+
+        self._model = None
+        self._capture = None
+        self._thread = None
+        self._stop_event = threading.Event()
+        self._callbacks = []
+        self._frame_count = 0
+
+        # small ring buffer for fps estimate
+        self._times = deque(maxlen=30)
+
+        self._ensure_model_available()
+        self._load_model()
+
+    def _ensure_model_available(self):
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        if self.model_path.exists():
+            return
+        # download via ultralytics and copy to vision/models
+        print("[vision] Model not found locally — downloading yolov8n.pt (this may take a minute)...")
+        tmp = YOLO("yolov8n.pt")  # ultralytics will download into cache and return a model object
+        src = getattr(tmp, "ckpt_path", None) or getattr(tmp, "best", None) or "yolov8n.pt"
+        if src and Path(src).exists():
+            shutil.copy(Path(src), self.model_path)
+            print(f"[vision] Model copied to {self.model_path}")
+        else:
+            # fallback: try downloading file name directly (should rarely happen)
+            print("[vision] Could not determine cached model path. Ensure internet and re-run.")
+            raise RuntimeError("failed to download model")
+
+    def _load_model(self):
+        print(f"[vision] Loading model from {self.model_path} ...")
+        self._model = YOLO(str(self.model_path))
+        # attempt to read class names (dict or list)
+        try:
+            model_names = getattr(self._model.model, "names", None)
+            if model_names:
+                print("[vision] Model classes (sample):", list(model_names.items())[:8])
+        except Exception:
+            pass
+
+    def _open_capture(self):
+        cap = cv2.VideoCapture(self.cap_device, cv2.CAP_V4L2)
+        # set desired resolution
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_w)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_h)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        time.sleep(0.2)
+        if not cap.isOpened():
+            # fallback to default backend
+            cap = cv2.VideoCapture(self.cap_device)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_w)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_h)
+            if not cap.isOpened():
+                raise RuntimeError(f"Cannot open video device {self.cap_device}")
+        return cap
+
+    def register_callback(self, fn):
+        """Register a callback that receives event dicts: fn(event_dict)"""
+        if callable(fn):
+            self._callbacks.append(fn)
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._capture = self._open_capture()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+        print("[vision] Started capture thread.")
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=2.0)
+        try:
+            if self._capture:
+                self._capture.release()
+        except Exception:
+            pass
+        print("[vision] Stopped.")
+
+    def _call_callbacks(self, event: dict):
+        for cb in self._callbacks:
+            try:
+                cb(event)
+            except Exception as e:
+                print("[vision] Callback error:", e)
+
+    def _extract_best_detection(self, results, frame):
+        """
+        returns event dict or None
+        """
+        if not results or len(results) == 0:
+            return None
+        r = results[0]
+        boxes = getattr(r, "boxes", None)
+        if boxes is None or len(boxes) == 0:
+            return None
+
+        # iterate boxes to pick best by confidence
+        best = None
+        best_conf = -1.0
+        for b in boxes:
+            # compatibility: b.conf may be tensor or list
+            try:
+                conf = float(b.conf[0]) if hasattr(b.conf, "__len__") and len(b.conf) > 0 else float(b.conf)
+            except Exception:
+                try:
+                    conf = float(b.conf)
+                except Exception:
+                    conf = 0.0
+            if conf > best_conf:
+                best_conf = conf
+                best = b
+
+        if best is None:
+            return None
+
+        # extract info
+        try:
+            cls_idx = int(best.cls[0]) if hasattr(best.cls, "__len__") and len(best.cls) > 0 else int(best.cls)
+        except Exception:
+            cls_idx = int(getattr(best, "cls", 0))
+
+        # class name
+        names = getattr(self._model.model, "names", None)
+        class_name = str(cls_idx)
+        if names and 0 <= cls_idx < len(names):
+            class_name = names[cls_idx]
+
+        # xyxy may be tensor-like
+        try:
+            xyxy = best.xyxy[0].cpu().numpy() if hasattr(best, "xyxy") else np.array([0, 0, 0, 0])
+            x1, y1, x2, y2 = [float(v) for v in xyxy]
+        except Exception:
+            try:
+                x1, y1, x2, y2 = [float(v) for v in best.xyxy]
+            except Exception:
+                x1 = y1 = x2 = y2 = 0.0
+
+        w = max(0.0, x2 - x1)
+        h = max(0.0, y2 - y1)
+        frame_area = max(1.0, frame.shape[0] * frame.shape[1])
+        bbox_area = w * h
+        bbox_area_norm = min(1.0, bbox_area / frame_area)
+        score = best_conf * bbox_area_norm
+
+        category = get_class_category(class_name)
+        conf_pct = round(best_conf * 100.0, 2)
+
+        event = {
+            "class": class_name,
+            "confidence": round(best_conf, 4),
+            "accuracy_pct": conf_pct,
+            "category": category,
+            "bbox": [round(x1, 2), round(y1, 2), round(w, 2), round(h, 2)],
+            "bbox_area_norm": round(bbox_area_norm, 4),
+            "score": round(score, 4),
+            "stop_recommendation": False,
+            "timestamp": time.time(),
+        }
+
+        # apply thresholds
+        t = self.thresholds.get(category, {"conf": 0.3, "score": 0.3})
+        if event["confidence"] >= t["conf"] and event["score"] >= t["score"]:
+            event["stop_recommendation"] = True
+
+        return event
+
+    def _run_loop(self):
+        try:
+            while not self._stop_event.is_set():
+                t0 = time.time()
+                ret, frame = self._capture.read()
+                if not ret or frame is None:
+                    time.sleep(0.02)
+                    continue
+
+                self._frame_count += 1
+                # inference only every N frames
+                if (self._frame_count % self.infer_every_n) != 0:
+                    self._times.append(time.time() - t0)
+                    continue
+
+                # run inference
+                try:
+                    results = self._model.predict(source=[frame],
+                                                  imgsz=max(self.frame_w, self.frame_h),
+                                                  conf=0.01,
+                                                  max_det=MAX_DETECTIONS,
+                                                  verbose=False)
+                except Exception as e:
+                    # fallback: try model(frame) call
+                    try:
+                        results = self._model(frame)
+                    except Exception as e2:
+                        print("[vision] inference error:", e, e2)
+                        results = []
+
+                event = self._extract_best_detection(results, frame)
+                if event:
+                    self._call_callbacks(event)
+                else:
+                    # send "no detection" event occasionally
+                    if (self._frame_count % (10 * self.infer_every_n)) == 0:
+                        self._call_callbacks({"class": None, "confidence": 0.0, "category": "none", "stop_recommendation": False, "timestamp": time.time()})
+
+                self._times.append(time.time() - t0)
+
+        except Exception as e:
+            print("[vision] thread error:", e)
+        finally:
+            try:
+                self._capture.release()
+            except Exception:
+                pass
+
+
+# --------------------
+# Example usage (script)
+# --------------------
+def _print_event(e):
+    print("[vision event]", e)
+
+
+if __name__ == "__main__":
+    vc = VisionController(infer_every_n=1)
+    vc.register_callback(_print_event)
+    vc.start()
+    print("VisionController started. Press Ctrl+C to stop.")
+    try:
+        while True:
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print("Stopping...")
+    finally:
+        vc.stop()
