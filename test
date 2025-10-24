@@ -1,130 +1,42 @@
-#!/usr/bin/env python3
-"""
-Low-latency ONNX detection (uses ultralytics to load yolov8n.onnx under the hood).
-- Reads from a TCP stream by default (127.0.0.1:8554) or change --source to 0 for direct capture.
-- Uses imgsz=320 for speed.
-"""
-import os, time, argparse, threading
-from pathlib import Path
-import cv2
-from ultralytics import YOLO
+import time
+import Adafruit_ADS1x15
+import RPi.GPIO as GPIO
 
-# force Qt platform if using GUI (optional)
-os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+# Initialize ADS1115
+adc = Adafruit_ADS1x15.ADS1115()
+GAIN = 1
 
-MODEL_ONNX = str(Path.home() / "NeoArm" / "vision" / "models" / "yolov8n.onnx")
-DEFAULT_SOURCE = "tcp://127.0.0.1:8554"  # or use "0" for direct capture with gst pipeline if available
-INFER_IMGSZ = 320
-CONF = 0.25
-MAX_DET = 5
+# Servo setup
+servo_pin = 18  # GPIO pin connected to servo
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(servo_pin, GPIO.OUT)
+pwm = GPIO.PWM(servo_pin, 50)  # 50Hz frequency
+pwm.start(0)
 
-# simple mapping (extend)
-CATEGORY_MAP = {
-    "bottle":"hard","cup":"hard","cell phone":"hard","phone":"hard",
-    "apple":"soft","banana":"soft","orange":"soft","person":"unknown","hand":"unknown"
-}
-def get_category(name):
-    return CATEGORY_MAP.get(name.lower(), "unknown")
+def set_servo_angle(angle):
+    duty = 2 + (angle / 18)
+    pwm.ChangeDutyCycle(duty)
+    time.sleep(0.02)
+    pwm.ChangeDutyCycle(0)
 
-class FrameSlot:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.frame = None
-        self.ts = 0.0
-    def put(self, f):
-        with self.lock:
-            self.frame = f
-            self.ts = time.time()
-    def get(self):
-        with self.lock:
-            return self.frame, self.ts
+try:
+    print("Starting potentiometer-servo test...")
+    while True:
+        try:
+            value = adc.read_adc(0, gain=GAIN)  # Read from A0
+            angle = int((value / 32767) * 180)  # Map 0–32767 to 0–180°
+            angle = max(0, min(180, angle))
+            print(f"Pot value: {value}, Servo angle: {angle}")
+            set_servo_angle(angle)
+            time.sleep(0.1)
+        except Exception as e:
+            print(f"[Warning] Read error: {str(e)}")
+            time.sleep(0.2)
 
-def capture_loop(src, slot, stop_ev, width=640, height=480):
-    # if src is "0" or int-like, open device; else use FFMPEG to read tcp stream
-    if str(src).isdigit():
-        cap = cv2.VideoCapture(int(src))
-    else:
-        cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG if str(src).startswith("tcp://") else 0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-    if not cap.isOpened():
-        print("ERROR: cannot open capture:", src)
-        stop_ev.set()
-        return
-    while not stop_ev.is_set():
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            time.sleep(0.01)
-            continue
-        slot.put(frame)
-    try:
-        cap.release()
-    except: pass
+except KeyboardInterrupt:
+    print("\nStopped by user")
 
-def infer_loop(model, slot, stop_ev):
-    names = getattr(model.model, "names", {})
-    last_print = 0
-    while not stop_ev.is_set():
-        frame, ts = slot.get()
-        if frame is None:
-            time.sleep(0.01)
-            continue
-        img = frame.copy()
-        t0 = time.time()
-        # Ultralytics model.predict -> will call onnxruntime under the hood for onnx model
-        results = model.predict(source=[img], imgsz=INFER_IMGSZ, conf=CONF, max_det=MAX_DET, verbose=False)
-        t_elapsed = time.time() - t0
-        detected = False
-        if results and len(results)>0:
-            r = results[0]
-            boxes = getattr(r, "boxes", [])
-            for b in boxes:
-                try:
-                    conf = float(b.conf[0]) if hasattr(b.conf, "__len__") else float(b.conf)
-                except:
-                    conf = float(getattr(b, "conf", 0.0))
-                try:
-                    cls_i = int(b.cls[0]) if hasattr(b.cls, "__len__") else int(b.cls)
-                except:
-                    cls_i = int(getattr(b, "cls", 0))
-                name = names.get(cls_i, str(cls_i))
-                category = get_category(name)
-                print(f"[{time.strftime('%H:%M:%S')}] DETECTED: {name} conf={conf:.2f} cat={category} inf_time={t_elapsed:.3f}s")
-                detected = True
-        if not detected and time.time() - last_print > 1.0:
-            print(f"[{time.strftime('%H:%M:%S')}] DETECTED: none (inf_time={t_elapsed:.3f}s)")
-            last_print = time.time()
-        # tiny pause to yield CPU
-        time.sleep(0.005)
-
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--source", "-s", default=DEFAULT_SOURCE, help="capture source (tcp://... or 0)")
-    args = p.parse_args()
-    src = args.source
-
-    print("[vision] loading ONNX model via ultralytics:", MODEL_ONNX)
-    model = YOLO(MODEL_ONNX)
-    print("[vision] model loaded. names sample:", list(getattr(model.model, "names", {}).items())[:6])
-
-    slot = FrameSlot()
-    stop_ev = threading.Event()
-    cap_t = threading.Thread(target=capture_loop, args=(src, slot, stop_ev), daemon=True)
-    inf_t = threading.Thread(target=infer_loop, args=(model, slot, stop_ev), daemon=True)
-
-    cap_t.start()
-    inf_t.start()
-    print("[vision] running. show object to camera. Ctrl+C to stop.")
-    try:
-        while True:
-            time.sleep(0.5)
-    except KeyboardInterrupt:
-        print("Stopping...")
-        stop_ev.set()
-        cap_t.join(timeout=1.0)
-        inf_t.join(timeout=1.0)
-        print("Exited.")
-
-if __name__ == "__main__":
-    main()
+finally:
+    pwm.stop()
+    GPIO.cleanup()
+    print("Clean exit")
