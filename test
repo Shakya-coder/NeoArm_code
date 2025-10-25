@@ -1,42 +1,41 @@
 import time
+import pigpio
 import Adafruit_ADS1x15
-import RPi.GPIO as GPIO
 
-# Initialize ADS1115
+# Initialize pigpio and ADC
+pi = pigpio.pi()
 adc = Adafruit_ADS1x15.ADS1115()
 GAIN = 1
 
-# Servo setup
-servo_pin = 18  # GPIO pin connected to servo
-GPIO.setmode(GPIO.BCM)
-GPIO.setup(servo_pin, GPIO.OUT)
-pwm = GPIO.PWM(servo_pin, 50)  # 50Hz frequency
-pwm.start(0)
+# Servo pin (BCM numbering)
+SERVO_PIN = 18
+
+# Servo pulse range (microseconds)
+SERVO_MIN = 500     # 0 degrees
+SERVO_MAX = 2500    # 180 degrees
 
 def set_servo_angle(angle):
-    duty = 2 + (angle / 18)
-    pwm.ChangeDutyCycle(duty)
-    time.sleep(0.02)
-    pwm.ChangeDutyCycle(0)
+    pulse = SERVO_MIN + (angle / 180) * (SERVO_MAX - SERVO_MIN)
+    pi.set_servo_pulsewidth(SERVO_PIN, pulse)
 
 try:
-    print("Starting potentiometer-servo test...")
+    print("Starting smooth potentiometer-servo test...")
     while True:
         try:
-            value = adc.read_adc(0, gain=GAIN)  # Read from A0
-            angle = int((value / 32767) * 180)  # Map 0–32767 to 0–180°
+            pot_value = adc.read_adc(0, gain=GAIN)  # Read from channel A0
+            angle = int((pot_value / 32767) * 180)  # Map ADC 0–32767 → 0–180°
             angle = max(0, min(180, angle))
-            print(f"Pot value: {value}, Servo angle: {angle}")
+            print(f"Pot: {pot_value} → Servo: {angle}°")
             set_servo_angle(angle)
-            time.sleep(0.1)
+            time.sleep(0.05)
         except Exception as e:
-            print(f"[Warning] Read error: {str(e)}")
-            time.sleep(0.2)
+            print(f"[Warning] ADC read error: {e}")
+            time.sleep(0.1)
 
 except KeyboardInterrupt:
-    print("\nStopped by user")
+    print("\nStopped by user.")
 
 finally:
-    pwm.stop()
-    GPIO.cleanup()
-    print("Clean exit")
+    pi.set_servo_pulsewidth(SERVO_PIN, 0)
+    pi.stop()
+    print("Clean exit.")
