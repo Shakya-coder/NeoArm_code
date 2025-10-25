@@ -7,35 +7,48 @@ pi = pigpio.pi()
 adc = Adafruit_ADS1x15.ADS1115()
 GAIN = 1
 
-# Servo pin (BCM numbering)
+# Servo settings
 SERVO_PIN = 18
+SERVO_MIN = 600    # 0 degrees
+SERVO_MAX = 2400   # 180 degrees
 
-# Servo pulse range (microseconds)
-SERVO_MIN = 500     # 0 degrees
-SERVO_MAX = 2500    # 180 degrees
-
+# Functions
 def set_servo_angle(angle):
-    pulse = SERVO_MIN + (angle / 180) * (SERVO_MAX - SERVO_MIN)
+    pulse = SERVO_MIN + (angle / 180.0) * (SERVO_MAX - SERVO_MIN)
     pi.set_servo_pulsewidth(SERVO_PIN, pulse)
 
-try:
-    print("Starting smooth potentiometer-servo test...")
-    while True:
-        try:
-            pot_value = adc.read_adc(0, gain=GAIN)  # Read from channel A0
-            angle = int((pot_value / 32767) * 180)  # Map ADC 0–32767 → 0–180°
-            angle = max(0, min(180, angle))
-            print(f"Pot: {pot_value} → Servo: {angle}°")
+def sweep_servo(current, target, step=1, delay=0.01):
+    if current == target:
+        return current
+    if current < target:
+        for angle in range(current, target + 1, step):
             set_servo_angle(angle)
-            time.sleep(0.05)
-        except Exception as e:
-            print(f"[Warning] ADC read error: {e}")
-            time.sleep(0.1)
+            time.sleep(delay)
+    else:
+        for angle in range(current, target - 1, -step):
+            set_servo_angle(angle)
+            time.sleep(delay)
+    return target
+
+def read_pot(channel=0, samples=5):
+    values = [adc.read_adc(channel, gain=GAIN) for _ in range(samples)]
+    return sum(values) / len(values)
+
+# Main
+current_angle = 90
+set_servo_angle(current_angle)
+
+try:
+    while True:
+        pot_value = read_pot()
+        target_angle = int((pot_value / 32767.0) * 180)
+        target_angle = max(0, min(180, target_angle))
+        current_angle = sweep_servo(current_angle, target_angle, step=1, delay=0.01)
+        print(f"Pot: {pot_value:.0f} → Servo: {current_angle}°")
 
 except KeyboardInterrupt:
-    print("\nStopped by user.")
+    pass
 
 finally:
     pi.set_servo_pulsewidth(SERVO_PIN, 0)
     pi.stop()
-    print("Clean exit.")
