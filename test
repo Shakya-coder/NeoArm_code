@@ -1,27 +1,28 @@
 #!/usr/bin/env python3
-# vision_lowlatency.py — low-latency detection (reads tcp stream)
-# Usage:
-#   source .venv/bin/activate
-#   python3 vision_lowlatency.py --source tcp://127.0.0.1:8554
+# vision_lowlatency_picam.py — low-latency YOLO detection using PiCamera2 (no TCP stream)
+# NeoArm version
 
-import os, time, argparse, threading
+import os, time, threading
 from pathlib import Path
 import cv2
+import numpy as np
 from ultralytics import YOLO
+from picamera2 import Picamera2
 
-# force Qt platform (helps with some VNC setups)
+# Force X11 for GUI
 os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
-# config
+# === Config ===
 MODEL_PATH = str(Path.home() / "NeoArm" / "vision" / "models" / "yolov8n.pt")
-IMG_W, IMG_H = 640, 480        # capture size (match rpicam-vid)
-INFER_IMGSZ = 320             # model input size for faster inference
-CONF = 0.30                   # detection confidence threshold
-SOURCE_DEFAULT = "tcp://127.0.0.1:8554"
+IMG_W, IMG_H = 640, 480
+INFER_IMGSZ = 320
+CONF = 0.30
 
-# simple category mapping
-CATEGORY_MAP = {"bottle":"hard","cup":"hard","cell phone":"hard","phone":"hard",
-                "apple":"soft","banana":"soft","orange":"soft","person":"unknown","hand":"unknown"}
+CATEGORY_MAP = {
+    "bottle": "hard", "cup": "hard", "cell phone": "hard", "phone": "hard",
+    "apple": "soft", "banana": "soft", "orange": "soft",
+    "person": "unknown", "hand": "unknown"
+}
 
 def get_category(name):
     return CATEGORY_MAP.get(name.lower(), "unknown")
@@ -40,29 +41,25 @@ class FrameBuffer:
         with self.lock:
             return self.frame, self.ts
 
-def capture_thread_func(src, buf: FrameBuffer, stop_event):
-    """Capture thread that continuously reads frames and places latest into buffer."""
-    cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG if src.startswith("tcp://") else 0)
-    # try setting props (may be ignored for tcp)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, IMG_W)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, IMG_H)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-    if not cap.isOpened():
-        print("ERROR: capture open failed for", src)
-        stop_event.set()
-        return
+def capture_thread_func(buf: FrameBuffer, stop_event):
+    """Continuously capture frames from PiCamera2."""
+    picam2 = Picamera2()
+    config = picam2.create_preview_configuration(main={"size": (IMG_W, IMG_H), "format": "RGB888"})
+    picam2.configure(config)
+    picam2.start()
+    print("[vision] Camera started using PiCamera2...")
+
     while not stop_event.is_set():
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            time.sleep(0.01)
-            continue
+        frame = picam2.capture_array()
         buf.put(frame)
-    try:
-        cap.release()
-    except: pass
+        # Short sleep helps manage CPU usage slightly
+        time.sleep(0.01)
+
+    picam2.stop()
+    print("[vision] Camera stopped.")
 
 def inference_thread_func(model, buf: FrameBuffer, stop_event):
-    """Inference thread: always takes latest frame (drops older ones), runs model, prints result."""
+    """Continuously take latest frame from buffer, run YOLO inference."""
     names = getattr(model.model, "names", {})
     last_print = 0
     while not stop_event.is_set():
@@ -70,15 +67,14 @@ def inference_thread_func(model, buf: FrameBuffer, stop_event):
         if frame is None:
             time.sleep(0.01)
             continue
-        # copy latest frame locally (small cost)
         img = frame.copy()
         t0 = time.time()
-        # run model on single frame; using smaller imgsz speeds it up
+
         results = model.predict(source=[img], imgsz=INFER_IMGSZ, conf=CONF, max_det=5, verbose=False)
         t_elapsed = time.time() - t0
-        # pick best detection (highest conf) OR print all
         detections = []
-        if results and len(results)>0:
+
+        if results and len(results) > 0:
             r = results[0]
             boxes = getattr(r, "boxes", [])
             for b in boxes:
@@ -93,34 +89,25 @@ def inference_thread_func(model, buf: FrameBuffer, stop_event):
                 name = names.get(cls_i, str(cls_i))
                 category = get_category(name)
                 detections.append((name, conf, category))
-        # print immediate result for user: best detection or none
+
         if detections:
-            # pick highest conf
             best = max(detections, key=lambda x: x[1])
             name, conf, category = best
             print(f"[{time.strftime('%H:%M:%S')}] DETECTED: {name} conf={conf:.2f} cat={category} (inf_time={t_elapsed:.2f}s)")
         else:
-            # print occasionally when nothing
             if time.time() - last_print > 1.0:
                 print(f"[{time.strftime('%H:%M:%S')}] DETECTED: none (inf_time={t_elapsed:.2f}s)")
                 last_print = time.time()
-        # small sleep to avoid 100% tight loop when model is slow
-        # but we deliberately don't sleep long so we always process the most recent frame
+
         time.sleep(0.01)
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--source", "-s", default=SOURCE_DEFAULT)
-    args = p.parse_args()
-    source = args.source
-
-    # load model (smallest)
     print("[vision] loading model", MODEL_PATH)
     model = YOLO(MODEL_PATH)
 
     buf = FrameBuffer()
     stop_event = threading.Event()
-    cap_thread = threading.Thread(target=capture_thread_func, args=(source, buf, stop_event), daemon=True)
+    cap_thread = threading.Thread(target=capture_thread_func, args=(buf, stop_event), daemon=True)
     inf_thread = threading.Thread(target=inference_thread_func, args=(model, buf, stop_event), daemon=True)
 
     cap_thread.start()
@@ -138,5 +125,4 @@ def main():
         print("Exited.")
 
 if __name__ == "__main__":
-    import argparse
     main()
