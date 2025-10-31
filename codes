@@ -1,85 +1,340 @@
 #!/usr/bin/env python3
-import os, time, subprocess, shutil
+# vision_module.py  (ffmpeg pipe capture version)
+# Replace the old capture logic with an ffmpeg -> rawvideo pipe reader so OpenCV doesn't need to open tcp://...
+
+import os, time, threading, subprocess, shlex, sys
 from pathlib import Path
+import cv2
+import numpy as np
+from ultralytics import YOLO
 
-# paths — update if different
-PROJECT_DIR = str(Path.home() / "NeoArm")
-VISION_MODULE_PATH = os.path.join(PROJECT_DIR, "vision", "vision_module.py")
-# Ensure vision package importable: add project dir to path
-import sys
-if PROJECT_DIR not in sys.path:
-    sys.path.insert(0, PROJECT_DIR)
+# keep same defaults as original
+MODEL_PATH = str(Path.home() / "NeoArm" / "vision" / "models" / "yolov8n.pt")
+IMG_W, IMG_H = 640, 480        # these are used for OpenCV properties (and fallback); ffmpeg uses stream size
+INFER_IMGSZ = 320
+CONF = 0.30
+SOURCE_DEFAULT = "tcp://127.0.0.1:8554"
 
-# start streamer command (same as your manual command)
-RPICAM_CMD = [
-    "/usr/bin/rpicam-vid",
-    "-t", "0",
-    "--inline",
-    "--listen",
-    "-o", "tcp://0.0.0.0:8554",
-    "--width", "1280",
-    "--height", "720",
-    "--framerate", "30",
-    "--roi", "0.0,0.0,1.0,1.0",
-]
+# voting + cooldown defaults
+VOTE_WINDOW_DEFAULT = 5
+COOLDOWN_SECONDS_DEFAULT = 30
 
-def start_streamer():
-    if shutil.which("rpicam-vid") is None:
-        print("rpicam-vid not found in PATH. Start it manually if needed.")
-        return None
-    p = subprocess.Popen(RPICAM_CMD, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    print("[main] started rpicam-vid pid=", p.pid)
-    return p
+CATEGORY_MAP = {
+    "bottle":"hard","cup":"hard","cell phone":"hard","phone":"hard",
+    "apple":"soft","banana":"soft","orange":"soft","person":"unknown","hand":"unknown"
+}
+def get_category(name):
+    return CATEGORY_MAP.get(name.lower(), "unknown")
 
-def stop_process(p):
-    if p is None:
-        return
-    try:
-        p.terminate()
+class FrameBuffer:
+    """Holds exactly one latest frame (thread-safe)."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.frame = None
+        self.ts = 0.0
+    def put(self, f):
+        with self.lock:
+            self.frame = f
+            self.ts = time.time()
+    def get(self):
+        with self.lock:
+            return self.frame, self.ts
+
+class VisionRunner:
+    """
+    VisionRunner with ffmpeg pipe capture for tcp streams.
+    Use:
+      runner = VisionRunner(source="tcp://127.0.0.1:8554", vote_window=5, cooldown=30, callback=on_category)
+      runner.start()
+      ...
+      runner.stop()
+    """
+    def __init__(self, source=None, vote_window=None, cooldown=None, callback=None, verbose=False,
+                 ff_width=1280, ff_height=720, ff_fps=30):
+        self.source = SOURCE_DEFAULT if source is None else source
+        self.vote_window = VOTE_WINDOW_DEFAULT if vote_window is None else int(vote_window)
+        self.cooldown_seconds = COOLDOWN_SECONDS_DEFAULT if cooldown is None else int(cooldown)
+        self.callback = callback
+        self.verbose = verbose
+
+        # ffmpeg expected incoming resolution (match rpicam-vid settings)
+        self.ff_width = int(ff_width)
+        self.ff_height = int(ff_height)
+        self.ff_fps = int(ff_fps)
+
+        self.buf = FrameBuffer()
+        self.stop_event = threading.Event()
+        self.cap_thread = None
+        self.inf_thread = None
+
+        self.model = None
+        self._model_lock = threading.Lock()
+
+        # ffmpeg process handle
+        self._ffproc = None
+
+    def _load_model(self):
+        with self._model_lock:
+            if self.model is None:
+                if self.verbose:
+                    print("[vision_module] loading model:", MODEL_PATH)
+                self.model = YOLO(MODEL_PATH)
+        return self.model
+
+    # --- FFmpeg pipe helpers ---
+    def _start_ffmpeg_pipe(self, tcp_source):
+        """
+        Start ffmpeg to read from tcp_source and output raw BGR frames to stdout.
+        Returns subprocess.Popen object or raises RuntimeError.
+        """
+        # build ffmpeg command (quiet but show warnings)
+        cmd = (
+            f"ffmpeg -hide_banner -loglevel warning -fflags nobuffer -flags low_delay "
+            f"-i {shlex.quote(tcp_source)} "
+            f"-f rawvideo -pix_fmt bgr24 -video_size {self.ff_width}x{self.ff_height} -r {self.ff_fps} -"
+        )
+        args = shlex.split(cmd)
+        # start process, capture stdout (raw frames) and stderr for errors
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**8)
+        # give it short time to fail fast if it cannot connect
+        time.sleep(0.2)
+        if proc.poll() is not None:
+            # read stderr for diagnostic
+            try:
+                err = proc.stderr.read().decode(errors="ignore")
+            except Exception:
+                err = "<no stderr available>"
+            raise RuntimeError("ffmpeg failed to start or connect: " + err[:600])
+        if self.verbose:
+            print("[vision_module] ffmpeg pipe started for", tcp_source, "pid=", proc.pid)
+        return proc
+
+    def _read_frame_from_ffmpeg(self, proc):
+        """
+        Read one raw BGR frame from ffmpeg stdout and return as numpy array (H,W,3).
+        Returns None if read failed or process ended.
+        """
+        frame_size = self.ff_width * self.ff_height * 3
+        if proc is None or proc.stdout is None:
+            return None
+        # read exactly frame_size bytes
+        raw = proc.stdout.read(frame_size)
+        if not raw or len(raw) < frame_size:
+            return None
+        arr = np.frombuffer(raw, dtype=np.uint8)
         try:
-            p.wait(timeout=2.0)
-        except subprocess.TimeoutExpired:
-            p.kill()
-    except Exception as e:
-        print("error stopping process:", e)
+            frame = arr.reshape((self.ff_height, self.ff_width, 3))
+            return frame
+        except Exception:
+            return None
 
-# import the module and VisionRunner
-try:
-    from vision.vision_module import VisionRunner
-except Exception as e:
-    print("Failed to import vision_module:", e)
-    raise
+    # --- capture thread using ffmpeg ---
+    def _capture_thread_func(self):
+        src = self.source
+        # only use ffmpeg for tcp:// sources; if source not tcp, fall back to cv2.VideoCapture
+        if isinstance(src, str) and src.startswith("tcp://"):
+            try:
+                ffproc = self._start_ffmpeg_pipe(src)
+                self._ffproc = ffproc
+            except Exception as e:
+                print("[vision_module] ERROR: ffmpeg pipe start failed for", src, "->", e)
+                self.stop_event.set()
+                return
 
-# This will be called whenever VisionRunner selects a category
-def on_category(cat):
-    print("[MAIN] category callback:", cat)
-    # connect this to your NeoArm logic:
-    # if cat == "hard": strong_grip()
-    # elif cat == "soft": soft_grip()
-    # else: relax_grip()
+            if self.verbose:
+                print("[vision_module] capture (ffmpeg pipe) opened:", src)
 
-def main():
-    streamer = start_streamer()
-    # give streamer time to initialize
-    time.sleep(1.5)
+            while not self.stop_event.is_set():
+                try:
+                    frame = self._read_frame_from_ffmpeg(ffproc)
+                except Exception:
+                    frame = None
+                if frame is None:
+                    # if ffmpeg died, stop
+                    if ffproc.poll() is not None:
+                        if self.verbose:
+                            print("[vision_module] ffmpeg process ended, stopping capture")
+                        self.stop_event.set()
+                        break
+                    # no full frame yet; wait a bit
+                    time.sleep(0.01)
+                    continue
+                # frame is numpy BGR array
+                self.buf.put(frame)
 
-    runner = VisionRunner(source="tcp://127.0.0.1:8554", vote_window=5, cooldown=30, callback=on_category, verbose=True)
-    runner.start()
-    print("[main] VisionRunner started. Waiting for categories... (Ctrl+C to stop)")
+            # cleanup ffmpeg process
+            try:
+                if ffproc and ffproc.poll() is None:
+                    ffproc.terminate()
+                    ffproc.wait(timeout=1.0)
+            except Exception:
+                pass
 
-    try:
-        while True:
-            time.sleep(0.5)
-            # optional: monitor runner and restart if died
-            if not runner.is_running():
-                print("[main] VisionRunner not running, exiting.")
-                break
-    except KeyboardInterrupt:
-        print("[main] KeyboardInterrupt — stopping")
-    finally:
-        runner.stop()
-        stop_process(streamer)
-        print("[main] exited cleanly")
+            if self.verbose:
+                print("[vision_module] capture thread exiting (ffmpeg)")
+            return
 
-if __name__ == "__main__":
-    main()
+        # fallback: non-tcp source -> use OpenCV VideoCapture (keeps behavior)
+        try:
+            idx = 0 if src is None else int(src)
+            cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+        except Exception:
+            try:
+                cap = cv2.VideoCapture(src)
+            except Exception:
+                cap = None
+
+        if not cap or not cap.isOpened():
+            print("[vision_module] ERROR: capture open failed for", src)
+            self.stop_event.set()
+            return
+
+        if self.verbose:
+            print("[vision_module] capture opened (cv2):", src)
+
+        while not self.stop_event.is_set():
+            try:
+                ret, frame = cap.read()
+            except Exception:
+                ret, frame = False, None
+            if not ret or frame is None:
+                time.sleep(0.01)
+                continue
+            self.buf.put(frame)
+
+        try:
+            cap.release()
+        except:
+            pass
+
+        if self.verbose:
+            print("[vision_module] capture thread exiting (cv2)")
+
+    # --- inference thread (same logic as before) ---
+    def _inference_thread_func(self):
+        model = self._load_model()
+        names = getattr(model.model, "names", {})
+        vote_list = []
+        cooldown_until = 0.0
+        last_print = 0.0
+
+        while not self.stop_event.is_set():
+            now = time.time()
+            if now < cooldown_until:
+                if self.verbose and now - last_print > 2.0:
+                    last_print = now
+                    print(f"[vision_module] in cooldown ({int(cooldown_until - now)}s left)")
+                time.sleep(0.1)
+                continue
+
+            frame, ts = self.buf.get()
+            if frame is None:
+                time.sleep(0.01)
+                continue
+
+            img = frame.copy()
+            t0 = time.time()
+            try:
+                results = model.predict(source=[img], imgsz=INFER_IMGSZ, conf=CONF, max_det=5, verbose=False)
+            except Exception as e:
+                if self.verbose:
+                    print("[vision_module] model.predict error:", e)
+                time.sleep(0.01)
+                continue
+            t_elapsed = time.time() - t0
+
+            best_cat = "unknown"
+            best_conf = 0.0
+            if results and len(results) > 0:
+                r = results[0]
+                boxes = getattr(r, "boxes", [])
+                for b in boxes:
+                    try:
+                        conf = float(b.conf[0]) if hasattr(b.conf, "__len__") else float(b.conf)
+                    except:
+                        conf = float(getattr(b, "conf", 0.0))
+                    try:
+                        cls_i = int(b.cls[0]) if hasattr(b.cls, "__len__") else int(b.cls)
+                    except:
+                        cls_i = int(getattr(b, "cls", 0))
+                    name = names.get(cls_i, str(cls_i))
+                    category = get_category(name)
+                    if conf > best_conf:
+                        best_conf = conf
+                        best_cat = category
+
+            vote_list.append((best_cat, float(best_conf)))
+            if len(vote_list) > self.vote_window:
+                vote_list.pop(0)
+
+            if self.verbose:
+                print(f"[vision_module] vote #{len(vote_list)} -> {best_cat} ({best_conf:.2f}) inf_t={t_elapsed:.2f}s")
+
+            if len(vote_list) >= self.vote_window:
+                # decide final
+                freq = {}
+                conf_sum = {}
+                for cat, conf in vote_list:
+                    freq[cat] = freq.get(cat, 0) + 1
+                    conf_sum[cat] = conf_sum.get(cat, 0.0) + conf
+                best_count = -1
+                best_cat = None
+                for c, cnt in freq.items():
+                    if cnt > best_count:
+                        best_count = cnt
+                        best_cat = c
+                tied = [c for c, cnt in freq.items() if cnt == best_count]
+                if len(tied) > 1:
+                    best_cat = max(tied, key=lambda c: conf_sum.get(c, 0.0))
+                final_cat = best_cat if best_cat in ("hard", "soft") else "unknown"
+
+                print(f"CATEGORY_SELECTED: {final_cat}")
+                try:
+                    sys.stdout.flush()
+                except:
+                    pass
+
+                if callable(self.callback):
+                    try:
+                        threading.Thread(target=self.callback, args=(final_cat,), daemon=True).start()
+                    except Exception:
+                        pass
+
+                vote_list = []
+                cooldown_until = time.time() + self.cooldown_seconds
+                if self.verbose:
+                    print(f"[vision_module] cooldown started for {self.cooldown_seconds}s")
+                continue
+
+            time.sleep(0.005)
+
+        if self.verbose:
+            print("[vision_module] inference thread exiting")
+
+    # Public API
+    def start(self):
+        if self.cap_thread and self.cap_thread.is_alive():
+            return
+        self.stop_event.clear()
+        self.cap_thread = threading.Thread(target=self._capture_thread_func, daemon=True)
+        self.inf_thread = threading.Thread(target=self._inference_thread_func, daemon=True)
+        self.cap_thread.start()
+        self.inf_thread.start()
+        if self.verbose:
+            print("[vision_module] started")
+
+    def stop(self):
+        self.stop_event.set()
+        # let threads cleanup; kill ffmpeg if still alive
+        try:
+            if self._ffproc and self._ffproc.poll() is None:
+                self._ffproc.terminate()
+                self._ffproc.wait(timeout=1.0)
+        except Exception:
+            pass
+        time.sleep(0.05)
+        if self.verbose:
+            print("[vision_module] stopped")
+
+    def is_running(self):
+        return (self.cap_thread and self.cap_thread.is_alive()) or (self.inf_thread and self.inf_thread.is_alive())
