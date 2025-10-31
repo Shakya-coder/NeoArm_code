@@ -1,179 +1,264 @@
-import serial
-import time
-import pigpio
-import RPi.GPIO as GPIO
-import threading
-import sys
+#!/usr/bin/env python3
+# vision_module.py
+# Module-adapted from your vision_lowlatency.py
+# Exposes VisionRunner which calls a callback when a category is decided.
 
-SERIAL_PORT = '/dev/ttyUSB0'
-BAUDRATE = 115200
+import os, time, threading
+from pathlib import Path
+import cv2
+from ultralytics import YOLO
 
-SERVO_PINS = [17, 18, 19, 20, 21]
-BUTTON_PIN = 4
+# keep same defaults as your original
+MODEL_PATH = str(Path.home() / "NeoArm" / "vision" / "models" / "yolov8n.pt")
+IMG_W, IMG_H = 640, 480
+INFER_IMGSZ = 320
+CONF = 0.30
+SOURCE_DEFAULT = "tcp://127.0.0.1:8554"
 
-OPEN_ANGLE = 0
-CLOSE_ANGLE = 90
-STEP_DEG = 3
-STEP_DELAY = 0.04
-THRESHOLDS = [500, 500, 500, 500, 500]
-TEMP_ABORT = 30.0
+# voting + cooldown defaults
+VOTE_WINDOW_DEFAULT = 5
+COOLDOWN_SECONDS_DEFAULT = 30
 
-def angle_to_pulse(a):
-    a = max(0.0, min(180.0, a))
-    return int(500 + (2500 - 500) * (a / 180.0))
+CATEGORY_MAP = {
+    "bottle":"hard","cup":"hard","cell phone":"hard","phone":"hard",
+    "apple":"soft","banana":"soft","orange":"soft","person":"unknown","hand":"unknown"
+}
+def get_category(name):
+    return CATEGORY_MAP.get(name.lower(), "unknown")
 
-class SimpleServoController:
-    def __init__(self, pi, pins):
-        self.pi = pi
-        self.pins = list(pins)
-        self.current = {p: OPEN_ANGLE for p in self.pins}
-        for p in self.pins:
-            self.pi.set_servo_pulsewidth(p, angle_to_pulse(OPEN_ANGLE))
-        time.sleep(0.1)
+class FrameBuffer:
+    """Holds exactly one latest frame (thread-safe)."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.frame = None
+        self.ts = 0.0
+    def put(self, f):
+        with self.lock:
+            self.frame = f
+            self.ts = time.time()
+    def get(self):
+        with self.lock:
+            return self.frame, self.ts
 
-    def move_to_angle_by_pin(self, pin, angle):
-        self.current[pin] = angle
-        self.pi.set_servo_pulsewidth(pin, angle_to_pulse(angle))
+class VisionRunner:
+    """
+    Start with:
+       runner = VisionRunner(source="tcp://127.0.0.1:8554", vote_window=5, cooldown=30, callback=my_fn)
+       runner.start()
+    The provided callback will be called as: callback(category_str)
+    To stop: runner.stop()
+    """
+    def __init__(self, source=None, vote_window=None, cooldown=None, callback=None, verbose=False):
+        self.source = SOURCE_DEFAULT if source is None else source
+        self.vote_window = VOTE_WINDOW_DEFAULT if vote_window is None else int(vote_window)
+        self.cooldown_seconds = COOLDOWN_SECONDS_DEFAULT if cooldown is None else int(cooldown)
+        self.callback = callback  # function(category_str)
+        self.verbose = verbose
 
-    def open_all(self):
-        for p in self.pins:
-            self.move_to_angle_by_pin(p, OPEN_ANGLE)
+        self.buf = FrameBuffer()
+        self.stop_event = threading.Event()
+        self.cap_thread = None
+        self.inf_thread = None
 
-    def stop_all(self):
-        for p in self.pins:
-            self.pi.set_servo_pulsewidth(p, 0)
+        self.model = None
+        self._model_lock = threading.Lock()
 
-    def cleanup(self):
-        self.open_all()
-        time.sleep(0.2)
-        self.stop_all()
+    def _load_model(self):
+        with self._model_lock:
+            if self.model is None:
+                if self.verbose:
+                    print("[vision_module] loading model:", MODEL_PATH)
+                self.model = YOLO(MODEL_PATH)
+        return self.model
 
-latest_lock = threading.Lock()
-latest = {'fsr': [0,0,0,0,0], 'temp': 0.0, 'last_ts': None}
-stop_flag = threading.Event()
-
-def serial_thread_fn(port, baud):
-    global latest
-    while not stop_flag.is_set():
+    def _open_capture(self, src):
+        # uses same logic as original: if tcp:// -> CAP_FFMPEG else local index 0
         try:
-            with serial.Serial(port, baud, timeout=1) as ser:
-                time.sleep(1.0)
-                ser.reset_input_buffer()
-                while not stop_flag.is_set():
-                    raw = ser.readline()
-                    if not raw:
-                        continue
-                    line = raw.decode('ascii', errors='ignore').strip()
-                    if not line:
-                        continue
-                    parts = [p.strip() for p in line.split(',') if p.strip()!='']
-                    if len(parts) >= 6:
-                        try:
-                            fsrs = [int(float(parts[i])) for i in range(5)]
-                            temp = float(parts[5])
-                            with latest_lock:
-                                latest['fsr'] = fsrs
-                                latest['temp'] = temp
-                                latest['last_ts'] = time.time()
-                        except:
-                            pass
-        except Exception as e:
-            print("Serial error:", e)
-            time.sleep(2)
-
-state_lock = threading.Lock()
-state = 'idle'
-
-def button_callback(channel):
-    global state
-    with state_lock:
-        if state == 'idle':
-            print("Button pressed -> closing")
-            state = 'closing'
-        elif state == 'closing':
-            print("Button pressed -> open")
-            state = 'idle'
-        elif state == 'gripped':
-            print("Button pressed -> open")
-            state = 'idle'
-
-def run_actuation(pi, servo_ctrl):
-    global state
-    pins = servo_ctrl.pins
-    cur_angle = {p: OPEN_ANGLE for p in pins}
-    try:
-        while not stop_flag.is_set():
-            with state_lock:
-                s = state
-            if s == 'idle':
-                servo_ctrl.open_all()
-                time.sleep(0.2)
-                continue
-            if s == 'closing':
-                reached = {p: False for p in pins}
-                for p in pins:
-                    cur_angle[p] = OPEN_ANGLE
-                    servo_ctrl.move_to_angle_by_pin(p, OPEN_ANGLE)
-                while not all(reached.values()) and state == 'closing' and not stop_flag.is_set():
-                    with latest_lock:
-                        temp = latest['temp']
-                        fsr_vals = list(latest['fsr'])
-                    if temp >= TEMP_ABORT:
-                        print("Temp high:", temp)
-                        with state_lock:
-                            state = 'idle'
-                        servo_ctrl.open_all()
-                        break
-                    for idx, p in enumerate(pins):
-                        if reached[p]:
-                            continue
-                        val = fsr_vals[idx]
-                        if val >= THRESHOLDS[idx]:
-                            reached[p] = True
-                            print(f"Finger {idx} stop, val={val}")
-                            continue
-                        if cur_angle[p] < CLOSE_ANGLE:
-                            cur_angle[p] = min(CLOSE_ANGLE, cur_angle[p] + STEP_DEG)
-                            servo_ctrl.move_to_angle_by_pin(p, cur_angle[p])
-                    time.sleep(STEP_DELAY)
-                with state_lock:
-                    if state == 'closing':
-                        state = 'gripped'
-                        print("Grip done")
-            elif s == 'gripped':
-                time.sleep(0.1)
+            if isinstance(src, str) and src.startswith("tcp://"):
+                cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
             else:
+                # for local numeric or default, pass 0
+                idx = 0 if src is None else int(src)
+                cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+        except Exception:
+            try:
+                cap = cv2.VideoCapture(src)
+            except Exception:
+                cap = None
+
+        if cap:
+            try:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, IMG_W)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, IMG_H)
+                cap.set(cv2.CAP_PROP_FPS, 30)
+            except Exception:
+                pass
+
+        return cap
+
+    # capture thread (almost identical to yours)
+    def _capture_thread_func(self):
+        src = self.source
+        cap = self._open_capture(src)
+        if not cap or not cap.isOpened():
+            print("[vision_module] ERROR: capture open failed for", src)
+            self.stop_event.set()
+            return
+        if self.verbose:
+            print("[vision_module] capture opened:", src)
+        while not self.stop_event.is_set():
+            try:
+                ret, frame = cap.read()
+            except Exception:
+                ret, frame = False, None
+            if not ret or frame is None:
+                time.sleep(0.01)
+                continue
+            self.buf.put(frame)
+        try:
+            cap.release()
+        except:
+            pass
+        if self.verbose:
+            print("[vision_module] capture thread exiting")
+
+    # inference thread with voting & cooldown
+    def _inference_thread_func(self):
+        model = self._load_model()
+        names = getattr(model.model, "names", {})
+        vote_list = []  # list of (category, conf)
+        cooldown_until = 0.0
+        last_print = 0.0
+
+        while not self.stop_event.is_set():
+            # respect cooldown (skip inference but still allow capture to fill buffer)
+            now = time.time()
+            if now < cooldown_until:
+                # optional status print
+                if self.verbose and now - last_print > 2.0:
+                    last_print = now
+                    print(f"[vision_module] in cooldown ({int(cooldown_until - now)}s left)")
                 time.sleep(0.1)
-    except Exception as e:
-        print("Actuation error:", e)
+                continue
 
-def main():
-    th = threading.Thread(target=serial_thread_fn, args=(SERIAL_PORT, BAUDRATE), daemon=True)
-    th.start()
-    print("Serial reader started")
+            frame, ts = self.buf.get()
+            if frame is None:
+                time.sleep(0.01)
+                continue
 
-    pi = pigpio.pi()
-    if not pi.connected:
-        print("pigpio not running!")
-        stop_flag.set()
-        return
+            img = frame.copy()
+            t0 = time.time()
+            try:
+                results = model.predict(source=[img], imgsz=INFER_IMGSZ, conf=CONF, max_det=5, verbose=False)
+            except Exception as e:
+                if self.verbose:
+                    print("[vision_module] model.predict error:", e)
+                time.sleep(0.01)
+                continue
+            t_elapsed = time.time() - t0
 
-    servo_ctrl = SimpleServoController(pi, SERVO_PINS)
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    GPIO.add_event_detect(BUTTON_PIN, GPIO.FALLING, callback=button_callback, bouncetime=250)
-    print("Button ready")
+            # choose best detection in this frame
+            best_cat = "unknown"
+            best_conf = 0.0
+            if results and len(results) > 0:
+                r = results[0]
+                boxes = getattr(r, "boxes", [])
+                for b in boxes:
+                    try:
+                        conf = float(b.conf[0]) if hasattr(b.conf, "__len__") else float(b.conf)
+                    except:
+                        conf = float(getattr(b, "conf", 0.0))
+                    try:
+                        cls_i = int(b.cls[0]) if hasattr(b.cls, "__len__") else int(b.cls)
+                    except:
+                        cls_i = int(getattr(b, "cls", 0))
+                    name = names.get(cls_i, str(cls_i))
+                    category = get_category(name)
+                    if conf > best_conf:
+                        best_conf = conf
+                        best_cat = category
 
-    try:
-        run_actuation(pi, servo_ctrl)
-    except KeyboardInterrupt:
-        print("Keyboard interrupt")
-    finally:
-        stop_flag.set()
-        GPIO.cleanup()
-        servo_ctrl.cleanup()
-        pi.stop()
-        print("Exit clean")
+            vote_list.append((best_cat, float(best_conf)))
+            # keep only last vote_window items
+            if len(vote_list) > self.vote_window:
+                vote_list.pop(0)
 
-if __name__ == "__main__":
-    main()
+            if self.verbose:
+                print(f"[vision_module] vote #{len(vote_list)} -> {best_cat} ({best_conf:.2f}) inf_t={t_elapsed:.2f}s")
+
+            # once we have enough votes decide
+            if len(vote_list) >= self.vote_window:
+                # count and sum confidences
+                freq = {}
+                conf_sum = {}
+                for cat, conf in vote_list:
+                    freq[cat] = freq.get(cat, 0) + 1
+                    conf_sum[cat] = conf_sum.get(cat, 0.0) + conf
+                # pick max count, tie break by conf_sum
+                best_count = -1
+                best_cat = None
+                for c, cnt in freq.items():
+                    if cnt > best_count:
+                        best_count = cnt
+                        best_cat = c
+                tied = [c for c, cnt in freq.items() if cnt == best_count]
+                if len(tied) > 1:
+                    best_cat = max(tied, key=lambda c: conf_sum.get(c, 0.0))
+                final_cat = best_cat if best_cat in ("hard", "soft") else "unknown"
+
+                # announce
+                print(f"CATEGORY_SELECTED: {final_cat}")
+                try:
+                    # ensure immediate stdout flush for main reading stdout
+                    import sys
+                    sys.stdout.flush()
+                except:
+                    pass
+
+                # call callback if provided (non-blocking call)
+                if callable(self.callback):
+                    try:
+                        # call in a separate thread so callback doesn't block inference thread
+                        threading.Thread(target=self.callback, args=(final_cat,), daemon=True).start()
+                    except Exception:
+                        pass
+
+                # clear votes and set cooldown
+                vote_list = []
+                cooldown_until = time.time() + self.cooldown_seconds
+                if self.verbose:
+                    print(f"[vision_module] cooldown started for {self.cooldown_seconds}s")
+
+                # continue loop (cooldown is respected at top)
+                continue
+
+            # small sleep
+            time.sleep(0.005)
+
+        if self.verbose:
+            print("[vision_module] inference thread exiting")
+
+    # public API
+    def start(self):
+        """Start capture + inference threads. Non-blocking."""
+        if self.cap_thread and self.cap_thread.is_alive():
+            return
+        self.stop_event.clear()
+        self.cap_thread = threading.Thread(target=self._capture_thread_func, daemon=True)
+        self.inf_thread = threading.Thread(target=self._inference_thread_func, daemon=True)
+        self.cap_thread.start()
+        self.inf_thread.start()
+        if self.verbose:
+            print("[vision_module] started")
+
+    def stop(self):
+        """Stop threads and release resources."""
+        self.stop_event.set()
+        # threads are daemon; allow a moment for cleanup
+        time.sleep(0.05)
+        # model kept loaded for speed; release capture happens in thread end
+        if self.verbose:
+            print("[vision_module] stopped")
+
+    def is_running(self):
+        return (self.cap_thread and self.cap_thread.is_alive()) or (self.inf_thread and self.inf_thread.is_alive())
