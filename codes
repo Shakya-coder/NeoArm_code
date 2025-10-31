@@ -1,264 +1,85 @@
 #!/usr/bin/env python3
-# vision_module.py
-# Module-adapted from your vision_lowlatency.py
-# Exposes VisionRunner which calls a callback when a category is decided.
-
-import os, time, threading
+import os, time, subprocess, shutil
 from pathlib import Path
-import cv2
-from ultralytics import YOLO
 
-# keep same defaults as your original
-MODEL_PATH = str(Path.home() / "NeoArm" / "vision" / "models" / "yolov8n.pt")
-IMG_W, IMG_H = 640, 480
-INFER_IMGSZ = 320
-CONF = 0.30
-SOURCE_DEFAULT = "tcp://127.0.0.1:8554"
+# paths — update if different
+PROJECT_DIR = str(Path.home() / "NeoArm")
+VISION_MODULE_PATH = os.path.join(PROJECT_DIR, "vision", "vision_module.py")
+# Ensure vision package importable: add project dir to path
+import sys
+if PROJECT_DIR not in sys.path:
+    sys.path.insert(0, PROJECT_DIR)
 
-# voting + cooldown defaults
-VOTE_WINDOW_DEFAULT = 5
-COOLDOWN_SECONDS_DEFAULT = 30
+# start streamer command (same as your manual command)
+RPICAM_CMD = [
+    "/usr/bin/rpicam-vid",
+    "-t", "0",
+    "--inline",
+    "--listen",
+    "-o", "tcp://0.0.0.0:8554",
+    "--width", "1280",
+    "--height", "720",
+    "--framerate", "30",
+    "--roi", "0.0,0.0,1.0,1.0",
+]
 
-CATEGORY_MAP = {
-    "bottle":"hard","cup":"hard","cell phone":"hard","phone":"hard",
-    "apple":"soft","banana":"soft","orange":"soft","person":"unknown","hand":"unknown"
-}
-def get_category(name):
-    return CATEGORY_MAP.get(name.lower(), "unknown")
+def start_streamer():
+    if shutil.which("rpicam-vid") is None:
+        print("rpicam-vid not found in PATH. Start it manually if needed.")
+        return None
+    p = subprocess.Popen(RPICAM_CMD, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print("[main] started rpicam-vid pid=", p.pid)
+    return p
 
-class FrameBuffer:
-    """Holds exactly one latest frame (thread-safe)."""
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.frame = None
-        self.ts = 0.0
-    def put(self, f):
-        with self.lock:
-            self.frame = f
-            self.ts = time.time()
-    def get(self):
-        with self.lock:
-            return self.frame, self.ts
-
-class VisionRunner:
-    """
-    Start with:
-       runner = VisionRunner(source="tcp://127.0.0.1:8554", vote_window=5, cooldown=30, callback=my_fn)
-       runner.start()
-    The provided callback will be called as: callback(category_str)
-    To stop: runner.stop()
-    """
-    def __init__(self, source=None, vote_window=None, cooldown=None, callback=None, verbose=False):
-        self.source = SOURCE_DEFAULT if source is None else source
-        self.vote_window = VOTE_WINDOW_DEFAULT if vote_window is None else int(vote_window)
-        self.cooldown_seconds = COOLDOWN_SECONDS_DEFAULT if cooldown is None else int(cooldown)
-        self.callback = callback  # function(category_str)
-        self.verbose = verbose
-
-        self.buf = FrameBuffer()
-        self.stop_event = threading.Event()
-        self.cap_thread = None
-        self.inf_thread = None
-
-        self.model = None
-        self._model_lock = threading.Lock()
-
-    def _load_model(self):
-        with self._model_lock:
-            if self.model is None:
-                if self.verbose:
-                    print("[vision_module] loading model:", MODEL_PATH)
-                self.model = YOLO(MODEL_PATH)
-        return self.model
-
-    def _open_capture(self, src):
-        # uses same logic as original: if tcp:// -> CAP_FFMPEG else local index 0
+def stop_process(p):
+    if p is None:
+        return
+    try:
+        p.terminate()
         try:
-            if isinstance(src, str) and src.startswith("tcp://"):
-                cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
-            else:
-                # for local numeric or default, pass 0
-                idx = 0 if src is None else int(src)
-                cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
-        except Exception:
-            try:
-                cap = cv2.VideoCapture(src)
-            except Exception:
-                cap = None
+            p.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            p.kill()
+    except Exception as e:
+        print("error stopping process:", e)
 
-        if cap:
-            try:
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, IMG_W)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, IMG_H)
-                cap.set(cv2.CAP_PROP_FPS, 30)
-            except Exception:
-                pass
+# import the module and VisionRunner
+try:
+    from vision.vision_module import VisionRunner
+except Exception as e:
+    print("Failed to import vision_module:", e)
+    raise
 
-        return cap
+# This will be called whenever VisionRunner selects a category
+def on_category(cat):
+    print("[MAIN] category callback:", cat)
+    # connect this to your NeoArm logic:
+    # if cat == "hard": strong_grip()
+    # elif cat == "soft": soft_grip()
+    # else: relax_grip()
 
-    # capture thread (almost identical to yours)
-    def _capture_thread_func(self):
-        src = self.source
-        cap = self._open_capture(src)
-        if not cap or not cap.isOpened():
-            print("[vision_module] ERROR: capture open failed for", src)
-            self.stop_event.set()
-            return
-        if self.verbose:
-            print("[vision_module] capture opened:", src)
-        while not self.stop_event.is_set():
-            try:
-                ret, frame = cap.read()
-            except Exception:
-                ret, frame = False, None
-            if not ret or frame is None:
-                time.sleep(0.01)
-                continue
-            self.buf.put(frame)
-        try:
-            cap.release()
-        except:
-            pass
-        if self.verbose:
-            print("[vision_module] capture thread exiting")
+def main():
+    streamer = start_streamer()
+    # give streamer time to initialize
+    time.sleep(1.5)
 
-    # inference thread with voting & cooldown
-    def _inference_thread_func(self):
-        model = self._load_model()
-        names = getattr(model.model, "names", {})
-        vote_list = []  # list of (category, conf)
-        cooldown_until = 0.0
-        last_print = 0.0
+    runner = VisionRunner(source="tcp://127.0.0.1:8554", vote_window=5, cooldown=30, callback=on_category, verbose=True)
+    runner.start()
+    print("[main] VisionRunner started. Waiting for categories... (Ctrl+C to stop)")
 
-        while not self.stop_event.is_set():
-            # respect cooldown (skip inference but still allow capture to fill buffer)
-            now = time.time()
-            if now < cooldown_until:
-                # optional status print
-                if self.verbose and now - last_print > 2.0:
-                    last_print = now
-                    print(f"[vision_module] in cooldown ({int(cooldown_until - now)}s left)")
-                time.sleep(0.1)
-                continue
+    try:
+        while True:
+            time.sleep(0.5)
+            # optional: monitor runner and restart if died
+            if not runner.is_running():
+                print("[main] VisionRunner not running, exiting.")
+                break
+    except KeyboardInterrupt:
+        print("[main] KeyboardInterrupt — stopping")
+    finally:
+        runner.stop()
+        stop_process(streamer)
+        print("[main] exited cleanly")
 
-            frame, ts = self.buf.get()
-            if frame is None:
-                time.sleep(0.01)
-                continue
-
-            img = frame.copy()
-            t0 = time.time()
-            try:
-                results = model.predict(source=[img], imgsz=INFER_IMGSZ, conf=CONF, max_det=5, verbose=False)
-            except Exception as e:
-                if self.verbose:
-                    print("[vision_module] model.predict error:", e)
-                time.sleep(0.01)
-                continue
-            t_elapsed = time.time() - t0
-
-            # choose best detection in this frame
-            best_cat = "unknown"
-            best_conf = 0.0
-            if results and len(results) > 0:
-                r = results[0]
-                boxes = getattr(r, "boxes", [])
-                for b in boxes:
-                    try:
-                        conf = float(b.conf[0]) if hasattr(b.conf, "__len__") else float(b.conf)
-                    except:
-                        conf = float(getattr(b, "conf", 0.0))
-                    try:
-                        cls_i = int(b.cls[0]) if hasattr(b.cls, "__len__") else int(b.cls)
-                    except:
-                        cls_i = int(getattr(b, "cls", 0))
-                    name = names.get(cls_i, str(cls_i))
-                    category = get_category(name)
-                    if conf > best_conf:
-                        best_conf = conf
-                        best_cat = category
-
-            vote_list.append((best_cat, float(best_conf)))
-            # keep only last vote_window items
-            if len(vote_list) > self.vote_window:
-                vote_list.pop(0)
-
-            if self.verbose:
-                print(f"[vision_module] vote #{len(vote_list)} -> {best_cat} ({best_conf:.2f}) inf_t={t_elapsed:.2f}s")
-
-            # once we have enough votes decide
-            if len(vote_list) >= self.vote_window:
-                # count and sum confidences
-                freq = {}
-                conf_sum = {}
-                for cat, conf in vote_list:
-                    freq[cat] = freq.get(cat, 0) + 1
-                    conf_sum[cat] = conf_sum.get(cat, 0.0) + conf
-                # pick max count, tie break by conf_sum
-                best_count = -1
-                best_cat = None
-                for c, cnt in freq.items():
-                    if cnt > best_count:
-                        best_count = cnt
-                        best_cat = c
-                tied = [c for c, cnt in freq.items() if cnt == best_count]
-                if len(tied) > 1:
-                    best_cat = max(tied, key=lambda c: conf_sum.get(c, 0.0))
-                final_cat = best_cat if best_cat in ("hard", "soft") else "unknown"
-
-                # announce
-                print(f"CATEGORY_SELECTED: {final_cat}")
-                try:
-                    # ensure immediate stdout flush for main reading stdout
-                    import sys
-                    sys.stdout.flush()
-                except:
-                    pass
-
-                # call callback if provided (non-blocking call)
-                if callable(self.callback):
-                    try:
-                        # call in a separate thread so callback doesn't block inference thread
-                        threading.Thread(target=self.callback, args=(final_cat,), daemon=True).start()
-                    except Exception:
-                        pass
-
-                # clear votes and set cooldown
-                vote_list = []
-                cooldown_until = time.time() + self.cooldown_seconds
-                if self.verbose:
-                    print(f"[vision_module] cooldown started for {self.cooldown_seconds}s")
-
-                # continue loop (cooldown is respected at top)
-                continue
-
-            # small sleep
-            time.sleep(0.005)
-
-        if self.verbose:
-            print("[vision_module] inference thread exiting")
-
-    # public API
-    def start(self):
-        """Start capture + inference threads. Non-blocking."""
-        if self.cap_thread and self.cap_thread.is_alive():
-            return
-        self.stop_event.clear()
-        self.cap_thread = threading.Thread(target=self._capture_thread_func, daemon=True)
-        self.inf_thread = threading.Thread(target=self._inference_thread_func, daemon=True)
-        self.cap_thread.start()
-        self.inf_thread.start()
-        if self.verbose:
-            print("[vision_module] started")
-
-    def stop(self):
-        """Stop threads and release resources."""
-        self.stop_event.set()
-        # threads are daemon; allow a moment for cleanup
-        time.sleep(0.05)
-        # model kept loaded for speed; release capture happens in thread end
-        if self.verbose:
-            print("[vision_module] stopped")
-
-    def is_running(self):
-        return (self.cap_thread and self.cap_thread.is_alive()) or (self.inf_thread and self.inf_thread.is_alive())
+if __name__ == "__main__":
+    main()
