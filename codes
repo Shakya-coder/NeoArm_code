@@ -1,86 +1,363 @@
 #!/usr/bin/env python3
-import os
+"""
+NeoArm main.py
+Single-file prototype:
+ - FSR + temp from ESP32 over serial
+ - Push-button to trigger finger actuation (5 servos)
+ - ADS1115-driven potentiometers for wrist & elbow (2 servos)
+ - Uses pigpio for servo PWM control
+
+Assumptions (from project chat):
+ - Finger servo BCM pins: 17,18,19,20,21  (thumb->pinky)
+ - Wrist/Elbow servo BCM pins: 22,23
+ - Button BCM pin: 4  (wired to GND, use internal pull-up)
+ - Serial port: /dev/ttyUSB0 @ 115200 (ESP32 sending "fsr0,fsr1,fsr2,fsr3,fsr4,temp")
+ - ADS1115 address 0x48, busnum=1
+ - Run pigpiod before running this script: sudo pigpiod
+"""
 import time
-import subprocess
-from vision_module import VisionRunner
+import threading
+import sys
+import signal
 
-# ===========================
-# SETTINGS
-# ===========================
-STREAM_CMD = (
-    "/usr/bin/rpicam-vid -t 0 --inline --listen "
-    "-o tcp://0.0.0.0:8554 "
-    "--width 1280 --height 720 "
-    "--framerate 30 "
-    "--roi 0.0,0.0,1.0,1.0"
-)
-TCP_SOURCE = "tcp://127.0.0.1:8554"
-VOTE_WINDOW = 5
-COOLDOWN = 0  # set 0 so it doesn't pause after detection
-VERBOSE = True
+import pigpio
+import RPi.GPIO as GPIO
+import Adafruit_ADS1x15
+import serial
 
-# ===========================
-# CALLBACK FUNCTION
-# ===========================
-def on_category(category):
-    """
-    This is called whenever the vision module finalizes a detection.
-    You can send this category to your motor or grip control logic here.
-    """
-    print(f"[MAIN] Category detected -> {category}")
-    # Example placeholder:
-    if category == "hard":
-        print("[MAIN] >>> Trigger HARD grip sequence")
-        # TODO: send signal to main control
-    elif category == "soft":
-        print("[MAIN] >>> Trigger SOFT grip sequence")
-    else:
-        print("[MAIN] >>> No valid category detected")
+# ---------------- Config ----------------
+SERIAL_PORT = '/dev/ttyUSB0'
+BAUDRATE = 115200
+SERIAL_TIMEOUT = 1.0  # seconds
 
+FINGER_PINS = [17, 18, 19, 20, 21]      # thumb -> pinky
+WRIST_ELBOW_PINS = [22, 23]             # wrist, elbow
 
-# ===========================
-# STARTUP
-# ===========================
-def start_stream():
-   
-    print("[MAIN] Starting rpicam-vid stream...")
-    proc = subprocess.Popen(
-        STREAM_CMD,
-        shell=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        preexec_fn=os.setpgrp  # avoid killing on Ctrl+C
-    )
-    print(f"[MAIN] Stream started (pid={proc.pid})")
-    return proc
+ALL_SERVOS = FINGER_PINS + WRIST_ELBOW_PINS
 
+BUTTON_PIN = 27                          # BCM, wired to GND, use internal pull-up
 
-def main():
-    stream_proc = start_stream()
-    time.sleep(2)  # small wait to ensure stream is ready
+OPEN_ANGLE = 0
+CLOSE_ANGLE = 180
 
-    print("[MAIN] Starting VisionRunner...")
-    runner = VisionRunner(
-        source=TCP_SOURCE,
-        vote_window=VOTE_WINDOW,
-        cooldown=COOLDOWN,
-        callback=on_category,
-        verbose=VERBOSE
-    )
-    runner.start()
+STEP_DEG = 3
+STEP_DELAY = 0.04
 
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\n[MAIN] Stopping vision system...")
-        runner.stop()
+# Default static thresholds (FSR raw values from ESP). Tune experimentally.
+THRESHOLDS = [500, 500, 500, 500, 500]
+
+# Safety temperature: abort gripping and open if temp >= this (°C)
+TEMP_ABORT = 40.0
+
+# ADC (ADS1115) config
+adc = Adafruit_ADS1x15.ADS1115(address=0x48, busnum=1)
+ADC_CHANNELS = [0, 1]   # channel 0 -> wrist pot, channel 1 -> elbow pot
+
+# ADS1115 single-ended raw range (we assume 0..32767 typical)
+ADC_RAW_MIN = 0
+ADC_RAW_MAX = 32767
+
+# servo pulse range (microseconds)
+SERVO_MIN_US = 500
+SERVO_MAX_US = 2500
+
+# ---------------- End Config ----------------
+
+# ---------------- Utilities ----------------
+def angle_to_pulse(a):
+    a = max(0.0, min(180.0, a))
+    return int(SERVO_MIN_US + (SERVO_MAX_US - SERVO_MIN_US) * (a / 180.0))
+
+# ---------------- Servo controller ----------------
+class SimpleServoController:
+    def _init_(self, pi: pigpio.pi, pins):
+        self.pi = pi
+        self.pins = list(pins)
+        self.current = {p: OPEN_ANGLE for p in self.pins}
+        # Initialize to OPEN_ANGLE
+        for p in self.pins:
+            self.pi.set_servo_pulsewidth(p, angle_to_pulse(OPEN_ANGLE))
+        time.sleep(0.12)
+
+    def move_to_angle_by_pin(self, pin, angle):
+        if pin not in self.pins:
+            raise ValueError(f"Pin {pin} not registered in controller")
+        self.current[pin] = angle
+        self.pi.set_servo_pulsewidth(pin, angle_to_pulse(angle))
+
+    def open_all(self):
+        for p in self.pins:
+            self.move_to_angle_by_pin(p, OPEN_ANGLE)
+
+    def close_all(self):
+        for p in self.pins:
+            self.move_to_angle_by_pin(p, CLOSE_ANGLE)
+
+    def stop_all(self):
+        for p in self.pins:
+            self.pi.set_servo_pulsewidth(p, 0)
+
+    def cleanup(self):
         try:
-            os.killpg(os.getpgid(stream_proc.pid), 15)
+            self.open_all()
+            time.sleep(0.15)
+            self.stop_all()
         except Exception:
             pass
-        print("[MAIN] Exited cleanly.")
 
+# ---------------- Serial reader thread ----------------
+latest_lock = threading.Lock()
+latest = {
+    'fsr': [0, 0, 0, 0, 0],
+    'temp': 0.0,
+    'last_ts': None
+}
+stop_flag = threading.Event()
 
-if __name__ == "__main__":
+def serial_thread_fn(port, baud):
+    """
+    Reads lines from ESP32 serial. Expected data lines:
+      "<fsr0>,<fsr1>,<fsr2>,<fsr3>,<fsr4>,<temp>"
+    Ignores lines that don't match.
+    """
+    global latest
+    while not stop_flag.is_set():
+        try:
+            with serial.Serial(port, baud, timeout=SERIAL_TIMEOUT) as ser:
+                time.sleep(1.0)  # allow ESP to settle
+                ser.reset_input_buffer()
+                while not stop_flag.is_set():
+                    try:
+                        raw = ser.readline()
+                        if not raw:
+                            continue
+                        try:
+                            line = raw.decode('ascii', errors='ignore').strip()
+                        except Exception:
+                            line = raw.decode('latin1', errors='ignore').strip()
+                        if not line:
+                            continue
+                        parts = [p.strip() for p in line.split(',') if p.strip() != '']
+                        if len(parts) >= 6:
+                            try:
+                                fsrs = [int(float(parts[i])) for i in range(5)]
+                                temp = float(parts[5])
+                                with latest_lock:
+                                    latest['fsr'] = fsrs
+                                    latest['temp'] = temp
+                                    latest['last_ts'] = time.time()
+                                # small debug print (comment out if noisy)
+                                # print(f"[SERIAL] fsr={fsrs} temp={temp}")
+                            except Exception:
+                                # bad parse: ignore line
+                                pass
+                        # else ignore other debug lines
+                    except Exception:
+                        # read/parse error: continue
+                        continue
+        except Exception as e:
+            # serial port open error -> keep retrying
+            print("[SERIAL] Serial open/read error:", e)
+            time.sleep(2.0)
+
+# ---------------- Actuation logic ----------------
+state_lock = threading.Lock()
+# states: 'idle' (open), 'closing' (active closing), 'gripped' (closed)
+state = 'idle'
+
+def button_callback(channel):
+    global state
+    with state_lock:
+        if state == 'idle':
+            state = 'closing'
+            print("[BUTTON] Press -> start closing")
+        elif state == 'closing':
+            state = 'idle'
+            print("[BUTTON] Press -> abort/stop (open)")
+        elif state == 'gripped':
+            state = 'idle'
+            print("[BUTTON] Press -> opening")
+
+def finger_actuation_loop(servo_ctrl: SimpleServoController, finger_pins):
+    """
+    Runs continuous loop to handle finger actuation based on state and FSR thresholds.
+    """
+    global state
+    # current angles per pin
+    cur_angle = {p: OPEN_ANGLE for p in finger_pins}
+
+    try:
+        while not stop_flag.is_set():
+            with state_lock:
+                s = state
+
+            if s == 'idle':
+                # ensure open
+                servo_ctrl.open_all()
+                time.sleep(0.12)
+                time.sleep(0.2)
+                continue
+
+            if s == 'closing':
+                # reset per-run
+                reached = {p: False for p in finger_pins}
+                for p in finger_pins:
+                    cur_angle[p] = OPEN_ANGLE
+                    servo_ctrl.move_to_angle_by_pin(p, OPEN_ANGLE)
+                time.sleep(0.08)
+
+                # close progressively until thresholds reached or aborted
+                while not all(reached.values()) and state == 'closing' and not stop_flag.is_set():
+                    with latest_lock:
+                        fsr_vals = list(latest['fsr'])
+                        temp = latest['temp']
+
+                    # safety temp check
+                    if temp >= TEMP_ABORT:
+                        print(f"[SAFETY] Temperature {temp:.1f}°C >= {TEMP_ABORT}°C: aborting and opening.")
+                        with state_lock:
+                            state = 'idle'
+                        servo_ctrl.open_all()
+                        break
+
+                    for idx, p in enumerate(finger_pins):
+                        if reached[p]:
+                            continue
+                        val = fsr_vals[idx] if idx < len(fsr_vals) else 0
+                        if val >= THRESHOLDS[idx]:
+                            reached[p] = True
+                            print(f"[GRIP] finger {idx} reached threshold ({val} >= {THRESHOLDS[idx]})")
+                            continue
+                        # move the servo a step
+                        if cur_angle[p] < CLOSE_ANGLE:
+                            cur_angle[p] = min(CLOSE_ANGLE, cur_angle[p] + STEP_DEG)
+                            servo_ctrl.move_to_angle_by_pin(p, cur_angle[p])
+                    time.sleep(STEP_DELAY)
+
+                with state_lock:
+                    if state == 'closing':
+                        state = 'gripped'
+                        print("[STATE] Gripping done -> state = gripped")
+                    else:
+                        print("[STATE] Closing interrupted; new state:", state)
+
+            elif s == 'gripped':
+                # wait for button press to open
+                time.sleep(0.12)
+            else:
+                time.sleep(0.12)
+
+    except Exception as e:
+        print("[ERROR] finger_actuation_loop:", e)
+
+def wrist_elbow_loop(servo_ctrl: SimpleServoController, we_pins, adc_channels):
+    """
+    Read ADS1115 potentiometers and move wrist/elbow servos continuously.
+    """
+    # map raw adc to 0..180 angle
+    def raw_to_angle(raw):
+        # clamp and scale
+        if raw is None:
+            return 90
+        if raw < ADC_RAW_MIN:
+            raw = ADC_RAW_MIN
+        if raw > ADC_RAW_MAX:
+            raw = ADC_RAW_MAX
+        return int((raw - ADC_RAW_MIN) / max(1, (ADC_RAW_MAX - ADC_RAW_MIN)) * 180)
+
+    try:
+        while not stop_flag.is_set():
+            for i, p in enumerate(we_pins):
+                try:
+                    ch = adc_channels[i]
+                    raw = adc.read_adc(ch, gain=1)
+                    angle = raw_to_angle(raw)
+                    servo_ctrl.move_to_angle_by_pin(p, angle)
+                except Exception as e:
+                    # If ADC read fails, ignore this cycle
+                    # print("[ADC] read error:", e)
+                    continue
+            time.sleep(0.04)
+    except Exception as e:
+        print("[ERROR] wrist_elbow_loop:", e)
+
+# ---------------- Main ----------------
+def main():
+    global state
+    print("NeoArm main starting... (make sure pigpiod is running)")
+
+    # Start serial thread
+    th_serial = threading.Thread(target=serial_thread_fn, args=(SERIAL_PORT, BAUDRATE), daemon=True)
+    th_serial.start()
+    print("[MAIN] Serial thread started.")
+
+    # Start pigpio
+    pi = pigpio.pi()
+    if not pi.connected:
+        print("[MAIN] pigpio not connected. Start pigpiod and retry (sudo pigpiod).")
+        stop_flag.set()
+        return
+
+    # Setup servo controller
+    servo_ctrl = SimpleServoController(pi, ALL_SERVOS)
+    print("[MAIN] Servo controller initialized. All servos set to OPEN_ANGLE.")
+
+    # Setup GPIO button
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.add_event_detect(BUTTON_PIN, GPIO.FALLING, callback=button_callback, bouncetime=250)
+    print(f"[MAIN] Button set on GPIO{BUTTON_PIN} (FALLING -> callback).")
+
+    # Start actuation threads
+    th_fingers = threading.Thread(target=finger_actuation_loop, args=(servo_ctrl, FINGER_PINS), daemon=True)
+    th_we = threading.Thread(target=wrist_elbow_loop, args=(servo_ctrl, WRIST_ELBOW_PINS, ADC_CHANNELS), daemon=True)
+    th_fingers.start()
+    th_we.start()
+    print("[MAIN] Actuation threads started (fingers, wrist/elbow).")
+
+    # Graceful shutdown handling
+    def shutdown(signum=None, frame=None):
+        print("\n[MAIN] Shutdown signal received. Cleaning up...")
+        stop_flag.set()
+        try:
+            GPIO.remove_event_detect(BUTTON_PIN)
+        except Exception:
+            pass
+        try:
+            GPIO.cleanup()
+        except Exception:
+            pass
+        try:
+            servo_ctrl.cleanup()
+        except Exception:
+            pass
+        try:
+            pi.stop()
+        except Exception:
+            pass
+        print("[MAIN] Clean exit.")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    # Keep alive
+    try:
+        while True:
+            time.sleep(1.0)
+            # optional: print heartbeat and last serial timestamp
+            with latest_lock:
+                ts = latest.get('last_ts')
+                fsr = latest.get('fsr')
+                tmp = latest.get('temp')
+            # print heartbeat every 5 seconds (comment if noisy)
+            # print(f"[HEART] last serial ts: {ts}, fsr: {fsr}, temp: {tmp}")
+    except SystemExit:
+        pass
+    except Exception as e:
+        print("[MAIN] Unexpected error:", e)
+    finally:
+        shutdown()
+
+if _name_ == "_main_":
     main()
