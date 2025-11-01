@@ -1,221 +1,432 @@
 #!/usr/bin/env python3
 """
-vision_lowlatency_auto.py
-- Try direct /dev/video capture; fall back to launching rpicam-vid -> tcp stream.
-- No GUI preview. Prints best detected object and category (hard/soft/unknown).
-Usage:
-    source .venv/bin/activate
-    python3 vision_lowlatency_auto.py
+NeoArm main.py (updated)
+ - Smooth open/close sweeps for fingers
+ - pigpio button callback with software debounce
+ - Serial FSR/temp reader, ADS1115 wrist/elbow, pigpio servo PWM
 """
-import os
 import time
 import threading
-import subprocess
+import sys
 import signal
-from pathlib import Path
-import argparse
 
-import cv2
-from ultralytics import YOLO
+import pigpio
+import Adafruit_ADS1x15
+import serial
 
-# -----------------------
-# Config
-# -----------------------
-ROOT = Path.home() / "NeoArm"
-MODEL_PATH = ROOT / "vision" / "models" / "yolov8n.pt"
-IMG_W, IMG_H = 640, 480
-INFER_IMGSZ = 320
-CONF = 0.30
-TCP_STREAM = "tcp://127.0.0.1:8554"
-RPICAM_CMD = [
-    "/usr/bin/rpicam-vid",
-    "-t", "0",
-    "--inline",
-    "--listen",
-    "-o", "tcp://0.0.0.0:8554",
-    "--width", str(IMG_W),
-    "--height", str(IMG_H),
-    "--framerate", "30"
-]
+# ---------------- Config ----------------
+SERIAL_PORT = '/dev/ttyUSB0'
+BAUDRATE = 115200
+SERIAL_TIMEOUT = 1.0  # seconds
 
-# simple category mapping and rules
-CATEGORY_MAP = {"bottle":"hard","cup":"hard","cell phone":"hard","phone":"hard",
-                "apple":"soft","banana":"soft","orange":"soft","person":"unknown","hand":"unknown"}
-def get_category(name):
-    return CATEGORY_MAP.get(name.lower(), "unknown")
+FINGER_PINS = [17, 18, 19, 20, 21]      # thumb -> pinky
+WRIST_ELBOW_PINS = [22, 23]             # wrist, elbow
 
-# -----------------------
-# Frame buffer
-# -----------------------
-class FrameBuffer:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.frame = None
-        self.ts = 0.0
-    def put(self, f):
-        with self.lock:
-            self.frame = f
-            self.ts = time.time()
-    def get(self):
-        with self.lock:
-            return self.frame, self.ts
+ALL_SERVOS = FINGER_PINS + WRIST_ELBOW_PINS
 
-# -----------------------
-# Capture / inference
-# -----------------------
-def start_rpicam_stream():
-    # start rpicam-vid as background process
-    print("[vision] Starting rpicam-vid stream...")
-    proc = subprocess.Popen(RPICAM_CMD, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=os.setsid)
-    time.sleep(0.8)  # give it a moment
-    return proc
+BUTTON_PIN = 27                          # BCM, wired to GND, use internal pull-up
+BUTTON_DEBOUNCE_S = 0.35                 # ignore presses within 350 ms
 
-def open_capture_prefer_dev0():
-    # Try direct device open first (no streaming)
-    cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
-    if cap is None or not cap.isOpened():
-        if cap:
-            try: cap.release()
-            except: pass
-        return None
-    # Configure
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, IMG_W)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, IMG_H)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-    return cap
+OPEN_ANGLE = 0
+CLOSE_ANGLE = 180
 
-def open_capture_tcp():
-    # FFmpeg backend tends to work for tcp streams
-    cap = cv2.VideoCapture(TCP_STREAM, cv2.CAP_FFMPEG)
-    if cap is None or not cap.isOpened():
-        if cap:
-            try: cap.release()
-            except: pass
-        return None
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, IMG_W)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, IMG_H)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-    return cap
+STEP_DEG = 3
+STEP_DELAY = 0.04
 
-def capture_thread_func(cap, buf: FrameBuffer, stop_event):
-    while not stop_event.is_set():
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            time.sleep(0.005)
-            continue
-        # small resize to target capture size (if needed)
-        if frame.shape[1] != IMG_W or frame.shape[0] != IMG_H:
-            frame = cv2.resize(frame, (IMG_W, IMG_H))
-        buf.put(frame)
-    try:
-        cap.release()
-    except: pass
+# Default static thresholds (FSR raw values from ESP). Tune experimentally.
+THRESHOLDS = [500, 500, 500, 500, 500]
 
-def inference_thread_func(model, buf: FrameBuffer, stop_event):
-    names = getattr(model.model, "names", {})
-    last_print = 0
-    while not stop_event.is_set():
-        frame, ts = buf.get()
-        if frame is None:
-            time.sleep(0.01)
-            continue
-        img = frame.copy()
-        t0 = time.time()
-        results = model.predict(source=[img], imgsz=INFER_IMGSZ, conf=CONF, max_det=5, verbose=False)
-        t_elapsed = time.time() - t0
-        detections = []
-        if results and len(results) > 0:
-            r = results[0]
-            boxes = getattr(r, "boxes", [])
-            for b in boxes:
-                # conf and class extraction robustly
+# Safety temperature: abort gripping and open if temp >= this (°C)
+TEMP_ABORT = 40.0
+
+# ADC (ADS1115) config
+adc = Adafruit_ADS1x15.ADS1115(address=0x48, busnum=1)
+ADC_CHANNELS = [0, 1]   # channel 0 -> wrist pot, channel 1 -> elbow pot
+
+# ADS1115 single-ended raw range (we assume 0..32767 typical)
+ADC_RAW_MIN = 0
+ADC_RAW_MAX = 32767
+
+# servo pulse range (microseconds)
+SERVO_MIN_US = 500
+SERVO_MAX_US = 2500
+
+# ---------------- End Config ----------------
+
+# ---------------- Utilities ----------------
+def angle_to_pulse(a):
+    a = max(0.0, min(180.0, a))
+    return int(SERVO_MIN_US + (SERVO_MAX_US - SERVO_MIN_US) * (a / 180.0))
+
+# ---------------- Servo controller (smooth open/close) ----------------
+class SimpleServoController:
+    def __init__(self, pi: pigpio.pi, pins):
+        self.pi = pi
+        self.pins = list(pins)
+        # current angle dict (float)
+        self.current = {p: float(OPEN_ANGLE) for p in self.pins}
+        # initialize to OPEN_ANGLE
+        for p in self.pins:
+            self.pi.set_servo_pulsewidth(p, angle_to_pulse(OPEN_ANGLE))
+        time.sleep(0.12)
+
+    def _set_angle_immediate(self, pin, angle):
+        # low-level set (int)
+        self.current[pin] = float(angle)
+        self.pi.set_servo_pulsewidth(pin, angle_to_pulse(angle))
+
+    def move_to_angle_by_pin(self, pin, angle):
+        if pin not in self.pins:
+            raise ValueError(f"Pin {pin} not registered in controller")
+        self._set_angle_immediate(pin, angle)
+
+    def stop_all(self):
+        for p in self.pins:
+            try:
+                self.pi.set_servo_pulsewidth(p, 0)
+            except Exception:
+                pass
+
+    def _smooth_move(self, targets: dict, step_deg=STEP_DEG, step_delay=STEP_DELAY):
+        """
+        Smoothly move multiple pins towards target angles (targets: {pin:angle}).
+        Moves all pins in lock-step until all targets reached.
+        """
+        # copy current values (float)
+        cur = {p: float(self.current.get(p, OPEN_ANGLE)) for p in self.pins}
+        # ensure all targets are present (if not -> leave unchanged)
+        tgs = {p: float(targets.get(p, cur[p])) for p in self.pins}
+        # quick return if already at target
+        if all(abs(cur[p] - tgs[p]) < 1e-3 for p in self.pins):
+            return
+        # compute maximum delta to determine steps
+        max_delta = max(abs(cur[p] - tgs[p]) for p in self.pins)
+        steps = max(1, int(max_delta / max(1e-6, step_deg)))
+        for _ in range(steps):
+            done = True
+            for p in self.pins:
+                if abs(cur[p] - tgs[p]) < 1e-6:
+                    continue
+                done = False
+                if cur[p] < tgs[p]:
+                    cur[p] = min(tgs[p], cur[p] + step_deg)
+                else:
+                    cur[p] = max(tgs[p], cur[p] - step_deg)
+                # apply
                 try:
-                    conf = float(b.conf[0]) if hasattr(b.conf, "__len__") else float(b.conf)
-                except:
-                    conf = float(getattr(b, "conf", 0.0))
-                try:
-                    cls_i = int(b.cls[0]) if hasattr(b.cls, "__len__") else int(b.cls)
-                except:
-                    cls_i = int(getattr(b, "cls", 0))
-                name = names.get(cls_i, str(cls_i))
-                category = get_category(name)
-                detections.append((name, conf, category))
-        if detections:
-            best = max(detections, key=lambda x: x[1])
-            name, conf, category = best
-            print(f"[{time.strftime('%H:%M:%S')}] DETECTED: {name} conf={conf:.2f} cat={category} (inf_time={t_elapsed:.2f}s)")
-        else:
-            if time.time() - last_print > 1.0:
-                print(f"[{time.strftime('%H:%M:%S')}] DETECTED: none (inf_time={t_elapsed:.2f}s)")
-                last_print = time.time()
-        # tiny sleep to avoid hogging CPU if model is very fast/slow
-        time.sleep(0.005)
+                    self.pi.set_servo_pulsewidth(p, angle_to_pulse(cur[p]))
+                    self.current[p] = float(cur[p])
+                except Exception:
+                    pass
+            if done:
+                break
+            time.sleep(step_delay)
+        # final exact set
+        for p in self.pins:
+            try:
+                self.pi.set_servo_pulsewidth(p, angle_to_pulse(tgs[p]))
+                self.current[p] = float(tgs[p])
+            except Exception:
+                pass
 
-# -----------------------
-# Main
-# -----------------------
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--force-tcp", action="store_true", help="Skip /dev/video0 probe and force rpicam-vid->tcp")
-    args = parser.parse_args()
+    def smooth_open(self, step_deg=STEP_DEG, step_delay=STEP_DELAY):
+        targets = {p: float(OPEN_ANGLE) for p in self.pins}
+        self._smooth_move(targets, step_deg=step_deg, step_delay=step_delay)
 
-    if not MODEL_PATH.exists():
-        print(f"[vision] ERROR: model not found at {MODEL_PATH}")
-        return
+    def smooth_close(self, step_deg=STEP_DEG, step_delay=STEP_DELAY):
+        targets = {p: float(CLOSE_ANGLE) for p in self.pins}
+        self._smooth_move(targets, step_deg=step_deg, step_delay=step_delay)
 
-    print("[vision] Loading model...", MODEL_PATH)
-    model = YOLO(str(MODEL_PATH))
-    print("[vision] Model loaded. Classes:", list(getattr(model.model, "names", {}).items())[:8])
-
-    cap = None
-    rpicam_proc = None
-
-    try:
-        if not args.force_tcp:
-            cap = open_capture_prefer_dev0()
-            if cap:
-                print("[vision] Opened direct device /dev/video0")
-        if cap is None:
-            # start rpicam-vid and open tcp
-            rpicam_proc = start_rpicam_stream()
-            # Try a few times for stream to be ready
-            ntries = 0
-            while ntries < 6:
-                cap = open_capture_tcp()
-                if cap:
-                    print("[vision] Connected to tcp stream", TCP_STREAM)
-                    break
-                time.sleep(0.5)
-                ntries += 1
-            if cap is None:
-                raise RuntimeError("Failed to open capture (neither /dev/video0 nor tcp stream).")
-        # start threads
-        buf = FrameBuffer()
-        stop_event = threading.Event()
-        cap_thread = threading.Thread(target=capture_thread_func, args=(cap, buf, stop_event), daemon=True)
-        inf_thread = threading.Thread(target=inference_thread_func, args=(model, buf, stop_event), daemon=True)
-        cap_thread.start()
-        inf_thread.start()
-
-        print("[vision] Running (no preview). Ctrl+C to stop.")
-        while True:
-            time.sleep(0.5)
-
-    except KeyboardInterrupt:
-        print("[vision] Interrupted by user.")
-    except Exception as e:
-        print("[vision] Fatal error:", e)
-    finally:
+    def cleanup(self):
         try:
-            stop_event.set()
-        except:
-            pass
-        try:
-            if rpicam_proc:
-                os.killpg(os.getpgid(rpicam_proc.pid), signal.SIGTERM)
+            self.smooth_open()
+            time.sleep(0.12)
+            self.stop_all()
         except Exception:
             pass
-        print("[vision] Exiting.")
+
+# ---------------- Serial reader thread ----------------
+latest_lock = threading.Lock()
+latest = {
+    'fsr': [0, 0, 0, 0, 0],
+    'temp': 0.0,
+    'last_ts': None
+}
+stop_flag = threading.Event()
+
+def serial_thread_fn(port, baud):
+    """
+    Reads lines from ESP32 serial. Expected data lines:
+      "<fsr0>,<fsr1>,<fsr2>,<fsr3>,<fsr4>,<temp>"
+    Ignores lines that don't match.
+    """
+    global latest
+    while not stop_flag.is_set():
+        try:
+            with serial.Serial(port, baud, timeout=SERIAL_TIMEOUT) as ser:
+                time.sleep(1.0)  # allow ESP to settle
+                ser.reset_input_buffer()
+                while not stop_flag.is_set():
+                    try:
+                        raw = ser.readline()
+                        if not raw:
+                            continue
+                        try:
+                            line = raw.decode('ascii', errors='ignore').strip()
+                        except Exception:
+                            line = raw.decode('latin1', errors='ignore').strip()
+                        if not line:
+                            continue
+                        parts = [p.strip() for p in line.split(',') if p.strip() != '']
+                        if len(parts) >= 6:
+                            try:
+                                fsrs = [int(float(parts[i])) for i in range(5)]
+                                temp = float(parts[5])
+                                with latest_lock:
+                                    latest['fsr'] = fsrs
+                                    latest['temp'] = temp
+                                    latest['last_ts'] = time.time()
+                                # debug - comment out if noisy
+                                # print(f"[SERIAL] fsr={fsrs} temp={temp}")
+                            except Exception:
+                                # bad parse: ignore line
+                                pass
+                        # else ignore other debug lines
+                    except Exception:
+                        # read/parse error: continue
+                        continue
+        except Exception as e:
+            print("[SERIAL] Serial open/read error:", e)
+            time.sleep(2.0)
+
+# ---------------- Actuation logic ----------------
+state_lock = threading.Lock()
+# states: 'idle' (open), 'closing' (active closing), 'gripped' (closed)
+state = 'idle'
+
+# button debounce
+_last_button_ts = 0.0
+
+def _register_button_press():
+    """Return True if press is accepted (debounced), False if ignored."""
+    global _last_button_ts
+    now = time.time()
+    if now - _last_button_ts < BUTTON_DEBOUNCE_S:
+        return False
+    _last_button_ts = now
+    return True
+
+def button_callback(pin):
+    """Called by pigpio wrapper. Applies software debounce and toggles state."""
+    global state
+    if not _register_button_press():
+        # debounced / ignored
+        return
+    with state_lock:
+        if state == 'idle':
+            state = 'closing'
+            print("[BUTTON] Press -> start closing")
+        elif state == 'closing':
+            state = 'idle'
+            print("[BUTTON] Press -> abort/stop (open)")
+        elif state == 'gripped':
+            state = 'idle'
+            print("[BUTTON] Press -> opening")
+
+def finger_actuation_loop(servo_ctrl: SimpleServoController, finger_pins):
+    """
+    Runs continuous loop to handle finger actuation based on state and FSR thresholds.
+    Closing moves in small steps per finger until threshold reached; opening uses smooth sweep.
+    """
+    global state
+    # current angles per pin
+    cur_angle = {p: float(OPEN_ANGLE) for p in finger_pins}
+
+    try:
+        while not stop_flag.is_set():
+            with state_lock:
+                s = state
+
+            if s == 'idle':
+                # only smooth-open if not already open
+                not_open = any(abs(servo_ctrl.current.get(p, OPEN_ANGLE) - OPEN_ANGLE) > 1.0 for p in finger_pins)
+                if not_open:
+                    servo_ctrl.smooth_open()
+                time.sleep(0.12)
+                continue
+
+            if s == 'closing':
+                # reset per-run
+                reached = {p: False for p in finger_pins}
+                for p in finger_pins:
+                    cur_angle[p] = float(OPEN_ANGLE)
+                    servo_ctrl.move_to_angle_by_pin(p, OPEN_ANGLE)
+                time.sleep(0.08)
+
+                # close progressively until thresholds reached or aborted
+                while not all(reached.values()) and state == 'closing' and not stop_flag.is_set():
+                    with latest_lock:
+                        fsr_vals = list(latest['fsr'])
+                        temp = latest['temp']
+
+                    # safety temp check
+                    if temp >= TEMP_ABORT:
+                        print(f"[SAFETY] Temperature {temp:.1f}°C >= {TEMP_ABORT}°C: aborting and opening.")
+                        with state_lock:
+                            state = 'idle'
+                        # smooth open
+                        servo_ctrl.smooth_open()
+                        break
+
+                    for idx, p in enumerate(finger_pins):
+                        if reached[p]:
+                            continue
+                        val = fsr_vals[idx] if idx < len(fsr_vals) else 0
+                        if val >= THRESHOLDS[idx]:
+                            reached[p] = True
+                            print(f"[GRIP] finger {idx} reached threshold ({val} >= {THRESHOLDS[idx]})")
+                            continue
+                        # move the servo a step (lock-step not necessary here)
+                        if cur_angle[p] < CLOSE_ANGLE:
+                            cur_angle[p] = min(CLOSE_ANGLE, cur_angle[p] + STEP_DEG)
+                            servo_ctrl.move_to_angle_by_pin(p, cur_angle[p])
+                    time.sleep(STEP_DELAY)
+
+                with state_lock:
+                    if state == 'closing':
+                        state = 'gripped'
+                        print("[STATE] Gripping done -> state = gripped")
+                    else:
+                        print("[STATE] Closing interrupted; new state:", state)
+
+            elif s == 'gripped':
+                # stay closed until button pressed -> opening (handled by button callback)
+                time.sleep(0.12)
+            else:
+                time.sleep(0.12)
+
+    except Exception as e:
+        print("[ERROR] finger_actuation_loop:", e)
+
+def wrist_elbow_loop(servo_ctrl: SimpleServoController, we_pins, adc_channels):
+    """
+    Read ADS1115 potentiometers and move wrist/elbow servos continuously.
+    """
+    # map raw adc to 0..180 angle
+    def raw_to_angle(raw):
+        # clamp and scale
+        if raw is None:
+            return 90
+        if raw < ADC_RAW_MIN:
+            raw = ADC_RAW_MIN
+        if raw > ADC_RAW_MAX:
+            raw = ADC_RAW_MAX
+        return int((raw - ADC_RAW_MIN) / max(1, (ADC_RAW_MAX - ADC_RAW_MIN)) * 180)
+
+    try:
+        while not stop_flag.is_set():
+            for i, p in enumerate(we_pins):
+                try:
+                    ch = adc_channels[i]
+                    raw = adc.read_adc(ch, gain=1)
+                    angle = raw_to_angle(raw)
+                    servo_ctrl.move_to_angle_by_pin(p, angle)
+                except Exception:
+                    continue
+            time.sleep(0.04)
+    except Exception as e:
+        print("[ERROR] wrist_elbow_loop:", e)
+
+# ---------------- Main ----------------
+def main():
+    global state, button_cb, pi
+    button_cb = None
+    pi = None
+
+    print("NeoArm main starting... (make sure pigpiod is running)")
+
+    # Start serial thread
+    th_serial = threading.Thread(target=serial_thread_fn, args=(SERIAL_PORT, BAUDRATE), daemon=True)
+    th_serial.start()
+    print("[MAIN] Serial thread started.")
+
+    # Start pigpio
+    pi = pigpio.pi()
+    if not pi.connected:
+        print("[MAIN] pigpio not connected. Start pigpiod and retry (sudo pigpiod).")
+        stop_flag.set()
+        return
+
+    # Setup servo controller
+    servo_ctrl = SimpleServoController(pi, ALL_SERVOS)
+    print("[MAIN] Servo controller initialized. All servos set to OPEN_ANGLE.")
+
+    # Setup button via pigpio callback (avoid RPi.GPIO edge-detect conflicts)
+    try:
+        pi.set_mode(BUTTON_PIN, pigpio.INPUT)
+        pi.set_pull_up_down(BUTTON_PIN, pigpio.PUD_UP)
+
+        # pigpio callback wrapper
+        def _pigpio_button_cb(gpio, level, tick):
+            # level: 0 = falling, 1 = rising, 2 = timeout
+            if level == 0:
+                try:
+                    button_callback(gpio)
+                except Exception as e:
+                    print("[MAIN] button callback error:", e)
+
+        button_cb = pi.callback(BUTTON_PIN, pigpio.FALLING_EDGE, _pigpio_button_cb)
+        print(f"[MAIN] Button set on GPIO{BUTTON_PIN} via pigpio (FALLING -> callback).")
+    except Exception as e:
+        print("[MAIN] Failed to setup button via pigpio:", e)
+        button_cb = None
+
+    # Start actuation threads
+    th_fingers = threading.Thread(target=finger_actuation_loop, args=(servo_ctrl, FINGER_PINS), daemon=True)
+    th_we = threading.Thread(target=wrist_elbow_loop, args=(servo_ctrl, WRIST_ELBOW_PINS, ADC_CHANNELS), daemon=True)
+    th_fingers.start()
+    th_we.start()
+    print("[MAIN] Actuation threads started (fingers, wrist/elbow).")
+
+    # Graceful shutdown handling
+    def shutdown(signum=None, frame=None):
+        print("\n[MAIN] Shutdown signal received. Cleaning up...")
+        stop_flag.set()
+        try:
+            if button_cb is not None:
+                button_cb.cancel()
+        except Exception:
+            pass
+        try:
+            servo_ctrl.cleanup()
+        except Exception:
+            pass
+        try:
+            pi.stop()
+        except Exception:
+            pass
+        print("[MAIN] Clean exit.")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    # Keep alive
+    try:
+        while True:
+            time.sleep(1.0)
+            # optional: print heartbeat and last serial timestamp
+            # with latest_lock:
+            #     ts = latest.get('last_ts')
+            #     fsr = latest.get('fsr')
+            #     tmp = latest.get('temp')
+            # print(f"[HEART] last serial ts: {ts}, fsr: {fsr}, temp: {tmp}")
+    except SystemExit:
+        pass
+    except Exception as e:
+        print("[MAIN] Unexpected error:", e)
+    finally:
+        shutdown()
 
 if __name__ == "__main__":
     main()
