@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-NeoArm main.py (updated)
+NeoArm main.py (integrated with category_module)
  - Smooth open/close sweeps for fingers
  - pigpio button callback with software debounce
  - Serial FSR/temp reader, ADS1115 wrist/elbow, pigpio servo PWM
+ - Integrates category_module to receive soft/hard/default thresholds
 """
 import time
 import threading
@@ -13,6 +14,9 @@ import signal
 import pigpio
 import Adafruit_ADS1x15
 import serial
+
+# import the category module (place category_module.py in same folder)
+import category_module
 
 # ---------------- Config ----------------
 SERIAL_PORT = '/dev/ttyUSB0'
@@ -33,7 +37,8 @@ CLOSE_ANGLE = 180
 STEP_DEG = 3
 STEP_DELAY = 0.04
 
-# Default static thresholds (FSR raw values from ESP). Tune experimentally.
+# Default static thresholds (unused directly — read from category_module)
+# kept for backwards compatibility
 THRESHOLDS = [500, 500, 500, 500, 500]
 
 # Safety temperature: abort gripping and open if temp >= this (°C)
@@ -51,7 +56,13 @@ ADC_RAW_MAX = 32767
 SERVO_MIN_US = 500
 SERVO_MAX_US = 2500
 
-# ---------------- End Config ----------------
+# LED pins to pass to the module (BCM)
+BLUE_LED_PIN = 5
+RED_LED_PIN = 6
+YELLOW_LED_PIN = None  # set a BCM pin if you have a yellow LED for default
+
+# category revert timeout (seconds)
+CATEGORY_TIMEOUT_S = 40  # revert to default if no new msg in this many seconds
 
 # ---------------- Utilities ----------------
 def angle_to_pulse(a):
@@ -65,7 +76,7 @@ class SimpleServoController:
         self.pins = list(pins)
         # current angle dict (float)
         self.current = {p: float(OPEN_ANGLE) for p in self.pins}
-        # initialize to OPEN_ANGLE
+        # initialize to OPEN_ANGLE pulses
         for p in self.pins:
             self.pi.set_servo_pulsewidth(p, angle_to_pulse(OPEN_ANGLE))
         time.sleep(0.12)
@@ -88,18 +99,10 @@ class SimpleServoController:
                 pass
 
     def _smooth_move(self, targets: dict, step_deg=STEP_DEG, step_delay=STEP_DELAY):
-        """
-        Smoothly move multiple pins towards target angles (targets: {pin:angle}).
-        Moves all pins in lock-step until all targets reached.
-        """
-        # copy current values (float)
         cur = {p: float(self.current.get(p, OPEN_ANGLE)) for p in self.pins}
-        # ensure all targets are present (if not -> leave unchanged)
         tgs = {p: float(targets.get(p, cur[p])) for p in self.pins}
-        # quick return if already at target
         if all(abs(cur[p] - tgs[p]) < 1e-3 for p in self.pins):
             return
-        # compute maximum delta to determine steps
         max_delta = max(abs(cur[p] - tgs[p]) for p in self.pins)
         steps = max(1, int(max_delta / max(1e-6, step_deg)))
         for _ in range(steps):
@@ -112,7 +115,6 @@ class SimpleServoController:
                     cur[p] = min(tgs[p], cur[p] + step_deg)
                 else:
                     cur[p] = max(tgs[p], cur[p] - step_deg)
-                # apply
                 try:
                     self.pi.set_servo_pulsewidth(p, angle_to_pulse(cur[p]))
                     self.current[p] = float(cur[p])
@@ -121,7 +123,6 @@ class SimpleServoController:
             if done:
                 break
             time.sleep(step_delay)
-        # final exact set
         for p in self.pins:
             try:
                 self.pi.set_servo_pulsewidth(p, angle_to_pulse(tgs[p]))
@@ -155,16 +156,11 @@ latest = {
 stop_flag = threading.Event()
 
 def serial_thread_fn(port, baud):
-    """
-    Reads lines from ESP32 serial. Expected data lines:
-      "<fsr0>,<fsr1>,<fsr2>,<fsr3>,<fsr4>,<temp>"
-    Ignores lines that don't match.
-    """
     global latest
     while not stop_flag.is_set():
         try:
             with serial.Serial(port, baud, timeout=SERIAL_TIMEOUT) as ser:
-                time.sleep(1.0)  # allow ESP to settle
+                time.sleep(1.0)
                 ser.reset_input_buffer()
                 while not stop_flag.is_set():
                     try:
@@ -186,14 +182,9 @@ def serial_thread_fn(port, baud):
                                     latest['fsr'] = fsrs
                                     latest['temp'] = temp
                                     latest['last_ts'] = time.time()
-                                # debug - comment out if noisy
-                                # print(f"[SERIAL] fsr={fsrs} temp={temp}")
                             except Exception:
-                                # bad parse: ignore line
                                 pass
-                        # else ignore other debug lines
                     except Exception:
-                        # read/parse error: continue
                         continue
         except Exception as e:
             print("[SERIAL] Serial open/read error:", e)
@@ -201,14 +192,10 @@ def serial_thread_fn(port, baud):
 
 # ---------------- Actuation logic ----------------
 state_lock = threading.Lock()
-# states: 'idle' (open), 'closing' (active closing), 'gripped' (closed)
 state = 'idle'
-
-# button debounce
 _last_button_ts = 0.0
 
 def _register_button_press():
-    """Return True if press is accepted (debounced), False if ignored."""
     global _last_button_ts
     now = time.time()
     if now - _last_button_ts < BUTTON_DEBOUNCE_S:
@@ -217,10 +204,8 @@ def _register_button_press():
     return True
 
 def button_callback(pin):
-    """Called by pigpio wrapper. Applies software debounce and toggles state."""
     global state
     if not _register_button_press():
-        # debounced / ignored
         return
     with state_lock:
         if state == 'idle':
@@ -234,12 +219,7 @@ def button_callback(pin):
             print("[BUTTON] Press -> opening")
 
 def finger_actuation_loop(servo_ctrl: SimpleServoController, finger_pins):
-    """
-    Runs continuous loop to handle finger actuation based on state and FSR thresholds.
-    Closing moves in small steps per finger until threshold reached; opening uses smooth sweep.
-    """
     global state
-    # current angles per pin
     cur_angle = {p: float(OPEN_ANGLE) for p in finger_pins}
 
     try:
@@ -248,7 +228,6 @@ def finger_actuation_loop(servo_ctrl: SimpleServoController, finger_pins):
                 s = state
 
             if s == 'idle':
-                # only smooth-open if not already open
                 not_open = any(abs(servo_ctrl.current.get(p, OPEN_ANGLE) - OPEN_ANGLE) > 1.0 for p in finger_pins)
                 if not_open:
                     servo_ctrl.smooth_open()
@@ -256,25 +235,24 @@ def finger_actuation_loop(servo_ctrl: SimpleServoController, finger_pins):
                 continue
 
             if s == 'closing':
-                # reset per-run
                 reached = {p: False for p in finger_pins}
                 for p in finger_pins:
                     cur_angle[p] = float(OPEN_ANGLE)
                     servo_ctrl.move_to_angle_by_pin(p, OPEN_ANGLE)
                 time.sleep(0.08)
 
-                # close progressively until thresholds reached or aborted
                 while not all(reached.values()) and state == 'closing' and not stop_flag.is_set():
                     with latest_lock:
                         fsr_vals = list(latest['fsr'])
                         temp = latest['temp']
 
-                    # safety temp check
+                    # read thresholds from category_module
+                    local_thresholds = category_module.get_thresholds()
+
                     if temp >= TEMP_ABORT:
                         print(f"[SAFETY] Temperature {temp:.1f}°C >= {TEMP_ABORT}°C: aborting and opening.")
                         with state_lock:
                             state = 'idle'
-                        # smooth open
                         servo_ctrl.smooth_open()
                         break
 
@@ -282,13 +260,13 @@ def finger_actuation_loop(servo_ctrl: SimpleServoController, finger_pins):
                         if reached[p]:
                             continue
                         val = fsr_vals[idx] if idx < len(fsr_vals) else 0
-                        if val >= THRESHOLDS[idx]:
+                        if val >= local_thresholds[idx]:
                             reached[p] = True
-                            print(f"[GRIP] finger {idx} reached threshold ({val} >= {THRESHOLDS[idx]})")
+                            print(f"[GRIP] finger {idx} reached threshold ({val} >= {local_thresholds[idx]})")
                             continue
-                        # move the servo a step (lock-step not necessary here)
                         if cur_angle[p] < CLOSE_ANGLE:
                             cur_angle[p] = min(CLOSE_ANGLE, cur_angle[p] + STEP_DEG)
+                            print(f"[MOVE] finger_idx={idx} pin={p} angle -> {cur_angle[p]:.1f}")
                             servo_ctrl.move_to_angle_by_pin(p, cur_angle[p])
                     time.sleep(STEP_DELAY)
 
@@ -300,7 +278,6 @@ def finger_actuation_loop(servo_ctrl: SimpleServoController, finger_pins):
                         print("[STATE] Closing interrupted; new state:", state)
 
             elif s == 'gripped':
-                # stay closed until button pressed -> opening (handled by button callback)
                 time.sleep(0.12)
             else:
                 time.sleep(0.12)
@@ -309,12 +286,7 @@ def finger_actuation_loop(servo_ctrl: SimpleServoController, finger_pins):
         print("[ERROR] finger_actuation_loop:", e)
 
 def wrist_elbow_loop(servo_ctrl: SimpleServoController, we_pins, adc_channels):
-    """
-    Read ADS1115 potentiometers and move wrist/elbow servos continuously.
-    """
-    # map raw adc to 0..180 angle
     def raw_to_angle(raw):
-        # clamp and scale
         if raw is None:
             return 90
         if raw < ADC_RAW_MIN:
@@ -357,18 +329,26 @@ def main():
         stop_flag.set()
         return
 
+    # start category module (pass pi and LED pins and timeout)
+    category_module.start(pi,
+                         host="0.0.0.0",
+                         port=9999,
+                         blue_pin=BLUE_LED_PIN,
+                         red_pin=RED_LED_PIN,
+                         yellow_pin=YELLOW_LED_PIN,
+                         timeout_s=CATEGORY_TIMEOUT_S)
+    print("[MAIN] category_module started (listening on 0.0.0.0:9999)")
+
     # Setup servo controller
     servo_ctrl = SimpleServoController(pi, ALL_SERVOS)
     print("[MAIN] Servo controller initialized. All servos set to OPEN_ANGLE.")
 
-    # Setup button via pigpio callback (avoid RPi.GPIO edge-detect conflicts)
+    # Setup button via pigpio callback
     try:
         pi.set_mode(BUTTON_PIN, pigpio.INPUT)
         pi.set_pull_up_down(BUTTON_PIN, pigpio.PUD_UP)
 
-        # pigpio callback wrapper
         def _pigpio_button_cb(gpio, level, tick):
-            # level: 0 = falling, 1 = rising, 2 = timeout
             if level == 0:
                 try:
                     button_callback(gpio)
@@ -402,6 +382,10 @@ def main():
         except Exception:
             pass
         try:
+            category_module.stop()
+        except Exception:
+            pass
+        try:
             pi.stop()
         except Exception:
             pass
@@ -415,12 +399,6 @@ def main():
     try:
         while True:
             time.sleep(1.0)
-            # optional: print heartbeat and last serial timestamp
-            # with latest_lock:
-            #     ts = latest.get('last_ts')
-            #     fsr = latest.get('fsr')
-            #     tmp = latest.get('temp')
-            # print(f"[HEART] last serial ts: {ts}, fsr: {fsr}, temp: {tmp}")
     except SystemExit:
         pass
     except Exception as e:
