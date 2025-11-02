@@ -1,566 +1,198 @@
-#!/usr/bin/env python3
-"""
-NeoArm main.py (with TCP category receiver & LED indicator)
- - Smooth open/close sweeps for fingers
- - pigpio button callback with software debounce
- - Serial FSR/temp reader, ADS1115 wrist/elbow, pigpio servo PWM
- - TCP server listens on PORT for 'soft' or 'hard' to set thresholds and indicator
-"""
-import time
-import threading
-import sys
-import signal
-import socket
+import socket, threading, time
 
-import pigpio
-import Adafruit_ADS1x15
-import serial
+# Defaults
+LISTEN_HOST = "0.0.0.0"
+LISTEN_PORT = 9999
 
-# ---------------- Config ----------------
-SERIAL_PORT = '/dev/ttyUSB0'
-BAUDRATE = 115200
-SERIAL_TIMEOUT = 1.0  # seconds
-
-FINGER_PINS = [17, 18, 19, 20, 21]      # thumb -> pinky
-WRIST_ELBOW_PINS = [22, 23]             # wrist, elbow
-
-ALL_SERVOS = FINGER_PINS + WRIST_ELBOW_PINS
-
-BUTTON_PIN = 27                          # BCM, wired to GND, use internal pull-up
-BUTTON_DEBOUNCE_S = 0.35                 # ignore presses within 350 ms
-
-OPEN_ANGLE = 0
-CLOSE_ANGLE = 180
-
-STEP_DEG = 3
-STEP_DELAY = 0.04
-
-# Default static thresholds (FSR raw values from ESP). These are used until a category arrives.
-THRESHOLDS = [500, 500, 500, 500, 500]
-
-# Soft/hard threshold values (applied when category received)
 SOFT_THRESHOLD = 400
 HARD_THRESHOLD = 800
+DEFAULT_THRESHOLD = 600
 
-# Safety temperature: abort gripping and open if temp >= this (°C)
-TEMP_ABORT = 40.0
+# LED pins (BCM). Set when starting the module.
+BLUE_LED_PIN = None
+RED_LED_PIN = None
+YELLOW_LED_PIN = None  # optional; if None fallback to blue+red for default
 
-# ADC (ADS1115) config
-adc = Adafruit_ADS1x15.ADS1115(address=0x48, busnum=1)
-ADC_CHANNELS = [0, 1]   # channel 0 -> wrist pot, channel 1 -> elbow pot
+# runtime state
+_lock = threading.Lock()
+_CURRENT_CATEGORY = "default"   # "soft" / "hard" / "default"
+_THRESHOLDS = [DEFAULT_THRESHOLD] * 5
+_last_recv_ts = None
 
-# ADS1115 single-ended raw range (we assume 0..32767 typical)
-ADC_RAW_MIN = 0
-ADC_RAW_MAX = 32767
+_server_thread = None
+_server_stop = threading.Event()
+_monitor_thread = None
+_monitor_stop = threading.Event()
 
-# servo pulse range (microseconds)
-SERVO_MIN_US = 500
-SERVO_MAX_US = 2500
-
-# ---------------- Category receiver & LED indicator config ----------------
-SERVER_HOST = "0.0.0.0"
-SERVER_PORT = 9999
-
-# LED GPIO pins (BCM) — change to your wiring
-BLUE_LED_PIN = 5   # blue LED indicates "soft"
-RED_LED_PIN = 6    # red LED indicates "hard"
-
-# ---------------- End Config ----------------
-
-# ---------------- Global runtime state ----------------
-latest_lock = threading.Lock()
-latest = {
-    'fsr': [0, 0, 0, 0, 0],
-    'temp': 0.0,
-    'last_ts': None
-}
-stop_flag = threading.Event()
-
-category_lock = threading.Lock()
-CURRENT_CATEGORY = None  # "soft" or "hard" or None
-
-# ---------------- Utilities ----------------
-def angle_to_pulse(a):
-    a = max(0.0, min(180.0, a))
-    return int(SERVO_MIN_US + (SERVO_MAX_US - SERVO_MIN_US) * (a / 180.0))
-
-# ---------------- Servo controller (smooth open/close) ----------------
-class SimpleServoController:
-    def __init__(self, pi: pigpio.pi, pins):
-        self.pi = pi
-        self.pins = list(pins)
-        # current angle dict (float)
-        self.current = {p: float(OPEN_ANGLE) for p in self.pins}
-        # initialize to OPEN_ANGLE
-        for p in self.pins:
-            self.pi.set_servo_pulsewidth(p, angle_to_pulse(OPEN_ANGLE))
-        time.sleep(0.12)
-
-    def _set_angle_immediate(self, pin, angle):
-        # low-level set (int)
-        self.current[pin] = float(angle)
-        self.pi.set_servo_pulsewidth(pin, angle_to_pulse(angle))
-
-    def move_to_angle_by_pin(self, pin, angle):
-        if pin not in self.pins:
-            raise ValueError(f"Pin {pin} not registered in controller")
-        self._set_angle_immediate(pin, angle)
-
-    def stop_all(self):
-        for p in self.pins:
-            try:
-                self.pi.set_servo_pulsewidth(p, 0)
-            except Exception:
-                pass
-
-    def _smooth_move(self, targets: dict, step_deg=STEP_DEG, step_delay=STEP_DELAY):
-        """
-        Smoothly move multiple pins towards target angles (targets: {pin:angle}).
-        Moves all pins in lock-step until all targets reached.
-        """
-        # copy current values (float)
-        cur = {p: float(self.current.get(p, OPEN_ANGLE)) for p in self.pins}
-        # ensure all targets are present (if not -> leave unchanged)
-        tgs = {p: float(targets.get(p, cur[p])) for p in self.pins}
-        # quick return if already at target
-        if all(abs(cur[p] - tgs[p]) < 1e-3 for p in self.pins):
-            return
-        # compute maximum delta to determine steps
-        max_delta = max(abs(cur[p] - tgs[p]) for p in self.pins)
-        steps = max(1, int(max_delta / max(1e-6, step_deg)))
-        for _ in range(steps):
-            done = True
-            for p in self.pins:
-                if abs(cur[p] - tgs[p]) < 1e-6:
-                    continue
-                done = False
-                if cur[p] < tgs[p]:
-                    cur[p] = min(tgs[p], cur[p] + step_deg)
-                else:
-                    cur[p] = max(tgs[p], cur[p] - step_deg)
-                # apply
-                try:
-                    self.pi.set_servo_pulsewidth(p, angle_to_pulse(cur[p]))
-                    self.current[p] = float(cur[p])
-                except Exception:
-                    pass
-            if done:
-                break
-            time.sleep(step_delay)
-        # final exact set
-        for p in self.pins:
-            try:
-                self.pi.set_servo_pulsewidth(p, angle_to_pulse(tgs[p]))
-                self.current[p] = float(tgs[p])
-            except Exception:
-                pass
-
-    def smooth_open(self, step_deg=STEP_DEG, step_delay=STEP_DELAY):
-        targets = {p: float(OPEN_ANGLE) for p in self.pins}
-        self._smooth_move(targets, step_deg=step_deg, step_delay=step_delay)
-
-    def smooth_close(self, step_deg=STEP_DEG, step_delay=STEP_DELAY):
-        targets = {p: float(CLOSE_ANGLE) for p in self.pins}
-        self._smooth_move(targets, step_deg=step_deg, step_delay=step_delay)
-
-    def cleanup(self):
-        try:
-            self.smooth_open()
-            time.sleep(0.12)
-            self.stop_all()
-        except Exception:
-            pass
-
-# ---------------- Serial reader thread ----------------
-def serial_thread_fn(port, baud):
-    """
-    Reads lines from ESP32 serial. Expected data lines:
-      "<fsr0>,<fsr1>,<fsr2>,<fsr3>,<fsr4>,<temp>"
-    Ignores lines that don't match.
-    """
-    global latest
-    while not stop_flag.is_set():
-        try:
-            with serial.Serial(port, baud, timeout=SERIAL_TIMEOUT) as ser:
-                time.sleep(1.0)  # allow ESP to settle
-                ser.reset_input_buffer()
-                while not stop_flag.is_set():
-                    try:
-                        raw = ser.readline()
-                        if not raw:
-                            continue
-                        try:
-                            line = raw.decode('ascii', errors='ignore').strip()
-                        except Exception:
-                            line = raw.decode('latin1', errors='ignore').strip()
-                        if not line:
-                            continue
-                        parts = [p.strip() for p in line.split(',') if p.strip() != '']
-                        if len(parts) >= 6:
-                            try:
-                                fsrs = [int(float(parts[i])) for i in range(5)]
-                                temp = float(parts[5])
-                                with latest_lock:
-                                    latest['fsr'] = fsrs
-                                    latest['temp'] = temp
-                                    latest['last_ts'] = time.time()
-                                # debug - comment out if noisy
-                                # print(f"[SERIAL] fsr={fsrs} temp={temp}")
-                            except Exception:
-                                # bad parse: ignore line
-                                pass
-                        # else ignore other debug lines
-                    except Exception:
-                        # read/parse error: continue
-                        continue
-        except Exception as e:
-            print("[SERIAL] Serial open/read error:", e)
-            time.sleep(2.0)
-
-# ---------------- Category receiver (TCP) & indicator ----------------
-def set_indicator(pi, category):
-    """
-    Turn on LED indicating category: blue for soft, red for hard.
-    If category is None -> turn both off.
-    """
+def _set_led(pi, category):
+    """Set LED outputs (nonfatal)."""
     try:
+        if pi is None:
+            return
         if category == "soft":
-            pi.write(BLUE_LED_PIN, 1)
-            pi.write(RED_LED_PIN, 0)
+            if BLUE_LED_PIN is not None:
+                pi.write(BLUE_LED_PIN, 1)
+            if RED_LED_PIN is not None:
+                pi.write(RED_LED_PIN, 0)
+            if YELLOW_LED_PIN is not None:
+                pi.write(YELLOW_LED_PIN, 0)
         elif category == "hard":
-            pi.write(BLUE_LED_PIN, 0)
-            pi.write(RED_LED_PIN, 1)
-        else:
-            # clear both
-            pi.write(BLUE_LED_PIN, 0)
-            pi.write(RED_LED_PIN, 0)
+            if BLUE_LED_PIN is not None:
+                pi.write(BLUE_LED_PIN, 0)
+            if RED_LED_PIN is not None:
+                pi.write(RED_LED_PIN, 1)
+            if YELLOW_LED_PIN is not None:
+                pi.write(YELLOW_LED_PIN, 0)
+        else:  # default
+            if YELLOW_LED_PIN is not None:
+                if BLUE_LED_PIN is not None:
+                    pi.write(BLUE_LED_PIN, 0)
+                if RED_LED_PIN is not None:
+                    pi.write(RED_LED_PIN, 0)
+                pi.write(YELLOW_LED_PIN, 1)
+            else:
+                # fallback: show both blue+red ON
+                if BLUE_LED_PIN is not None:
+                    pi.write(BLUE_LED_PIN, 1)
+                if RED_LED_PIN is not None:
+                    pi.write(RED_LED_PIN, 1)
     except Exception:
         pass
 
-def apply_category(category):
-    """Apply category to system: set CURRENT_CATEGORY and thresholds (thread-safe)."""
-    global CURRENT_CATEGORY, THRESHOLDS
-    cat = category.strip().lower() if category else None
-    with category_lock:
+def _apply_category(cat, pi=None):
+    """Thread-safe apply category and update LED."""
+    global _CURRENT_CATEGORY, _THRESHOLDS, _last_recv_ts
+    with _lock:
         if cat == "soft":
-            CURRENT_CATEGORY = "soft"
-            THRESHOLDS = [SOFT_THRESHOLD] * 5
+            _CURRENT_CATEGORY = "soft"
+            _THRESHOLDS = [SOFT_THRESHOLD] * 5
         elif cat == "hard":
-            CURRENT_CATEGORY = "hard"
-            THRESHOLDS = [HARD_THRESHOLD] * 5
+            _CURRENT_CATEGORY = "hard"
+            _THRESHOLDS = [HARD_THRESHOLD] * 5
         else:
-            CURRENT_CATEGORY = None
-            THRESHOLDS = [500] * 5  # fallback default
-    print(f"[CAT] Applied category={CURRENT_CATEGORY}, thresholds={THRESHOLDS}")
+            _CURRENT_CATEGORY = "default"
+            _THRESHOLDS = [DEFAULT_THRESHOLD] * 5
+        _last_recv_ts = time.time()
+    # update LED outside lock
+    _set_led(pi, _CURRENT_CATEGORY)
 
-def category_server_thread(pi, host=SERVER_HOST, port=SERVER_PORT):
-    """
-    Simple TCP server that accepts a single-line category message.
-    Expected payload: 'soft' or 'hard' (optionally newline).
-    Replies 'OK' after applying.
-    Runs until stop_flag is set.
-    """
-    print(f"[CATSRV] Starting category server on {host}:{port} ...")
+def _handle_connection(conn, addr, pi):
+    try:
+        data = conn.recv(1024)
+        if not data:
+            return
+        msg = data.decode("utf-8", errors="ignore").strip().lower()
+        if msg in ("soft", "hard"):
+            _apply_category(msg, pi=pi)
+            try:
+                conn.sendall(b"OK\n")
+            except Exception:
+                pass
+        else:
+            try:
+                conn.sendall(b"ERR\n")
+            except Exception:
+                pass
+    except Exception:
+        pass
+    finally:
+        try:
+            conn.close()
+        except:
+            pass
+
+def _server_loop(pi, host, port):
+    s = None
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((host, port))
         s.listen(1)
-        s.settimeout(1.0)  # so we can exit on stop_flag
+        s.settimeout(1.0)
     except Exception as e:
-        print("[CATSRV] Failed to start server:", e)
+        if s:
+            try: s.close()
+            except: pass
         return
 
-    while not stop_flag.is_set():
+    while not _server_stop.is_set():
         try:
             conn, addr = s.accept()
         except socket.timeout:
             continue
-        except Exception as e:
-            print("[CATSRV] Accept error:", e)
+        except Exception:
             break
-
-        with conn:
-            try:
-                data = conn.recv(1024)
-                if not data:
-                    continue
-                cat = data.decode('utf-8', errors='ignore').strip().lower()
-                print(f"[CATSRV] Received '{cat}' from {addr[0]}")
-                if cat in ("soft", "hard"):
-                    apply_category(cat)
-                    set_indicator(pi, cat)
-                    try:
-                        conn.sendall(b"OK\n")
-                    except Exception:
-                        pass
-                else:
-                    print("[CATSRV] Unknown category:", cat)
-                    # optionally clear indicator or leave as-is
-                    try:
-                        conn.sendall(b"ERR\n")
-                    except Exception:
-                        pass
-            except Exception as e:
-                print("[CATSRV] Connection handling error:", e)
-                continue
+        _handle_connection(conn, addr, pi)
 
     try:
         s.close()
     except:
         pass
-    print("[CATSRV] Category server stopped.")
 
-# ---------------- Actuation logic ----------------
-state_lock = threading.Lock()
-# states: 'idle' (open), 'closing' (active closing), 'gripped' (closed)
-state = 'idle'
+def _monitor_loop(pi, timeout_s):
+    """Monitor last recv time and revert to default when expired."""
+    global _last_recv_ts
+    while not _monitor_stop.is_set():
+        now = time.time()
+        with _lock:
+            last = _last_recv_ts
+        if last is None:
+            # no message yet; ensure default category active
+            _apply_category("default", pi=pi)
+        else:
+            if timeout_s is not None and (now - last) > timeout_s:
+                # revert to default once
+                _apply_category("default", pi=pi)
+                # reset last_recv to avoid repeated revert logs
+                with _lock:
+                    _last_recv_ts = None
+        time.sleep(0.5)
 
-# button debounce
-_last_button_ts = 0.0
-
-def _register_button_press():
-    """Return True if press is accepted (debounced), False if ignored."""
-    global _last_button_ts
-    now = time.time()
-    if now - _last_button_ts < BUTTON_DEBOUNCE_S:
+def start(pi=None, host=LISTEN_HOST, port=LISTEN_PORT,
+          blue_pin=None, red_pin=None, yellow_pin=None, timeout_s=40):
+    """
+    Start server and monitor threads.
+      - pi: pigpio.pi() instance (optional, for LEDs)
+      - blue_pin/red_pin/yellow_pin: BCM pins for LEDs (optional)
+      - timeout_s: seconds to revert to default when no new message received (None disables revert)
+    Returns True if started, False if already running.
+    """
+    global _server_thread, _server_stop, BLUE_LED_PIN, RED_LED_PIN, YELLOW_LED_PIN
+    global _monitor_thread, _monitor_stop
+    if _server_thread and _server_thread.is_alive():
         return False
-    _last_button_ts = now
+    BLUE_LED_PIN = blue_pin
+    RED_LED_PIN = red_pin
+    YELLOW_LED_PIN = yellow_pin
+    _server_stop.clear()
+    _monitor_stop.clear()
+    _server_thread = threading.Thread(target=_server_loop, args=(pi, host, port), daemon=True)
+    _server_thread.start()
+    _monitor_thread = threading.Thread(target=_monitor_loop, args=(pi, timeout_s), daemon=True)
+    _monitor_thread.start()
+    # ensure initial LED state is default
+    _apply_category("default", pi=pi)
     return True
 
-def button_callback(pin):
-    """Called by pigpio wrapper. Applies software debounce and toggles state."""
-    global state
-    if not _register_button_press():
-        # debounced / ignored
-        return
-    with state_lock:
-        if state == 'idle':
-            state = 'closing'
-            print("[BUTTON] Press -> start closing")
-        elif state == 'closing':
-            state = 'idle'
-            print("[BUTTON] Press -> abort/stop (open)")
-        elif state == 'gripped':
-            state = 'idle'
-            print("[BUTTON] Press -> opening")
+def stop():
+    """Stop server & monitor threads."""
+    global _server_stop, _monitor_stop, _server_thread, _monitor_thread
+    _server_stop.set()
+    _monitor_stop.set()
+    if _server_thread:
+        _server_thread.join(timeout=1.0)
+        _server_thread = None
+    if _monitor_thread:
+        _monitor_thread.join(timeout=1.0)
+        _monitor_thread = None
 
-def finger_actuation_loop(servo_ctrl: SimpleServoController, finger_pins):
-    """
-    Runs continuous loop to handle finger actuation based on state and FSR thresholds.
-    Closing moves in small steps per finger until threshold reached; opening uses smooth sweep.
-    """
-    global state, THRESHOLDS
-    # current angles per pin
-    cur_angle = {p: float(OPEN_ANGLE) for p in finger_pins}
+def get_category():
+    with _lock:
+        return _CURRENT_CATEGORY
 
-    try:
-        while not stop_flag.is_set():
-            with state_lock:
-                s = state
+def get_thresholds():
+    with _lock:
+        return list(_THRESHOLDS)
 
-            if s == 'idle':
-                # only smooth-open if not already open
-                not_open = any(abs(servo_ctrl.current.get(p, OPEN_ANGLE) - OPEN_ANGLE) > 1.0 for p in finger_pins)
-                if not_open:
-                    servo_ctrl.smooth_open()
-                time.sleep(0.12)
-                continue
-
-            if s == 'closing':
-                # reset per-run
-                reached = {p: False for p in finger_pins}
-                for p in finger_pins:
-                    cur_angle[p] = float(OPEN_ANGLE)
-                    servo_ctrl.move_to_angle_by_pin(p, OPEN_ANGLE)
-                time.sleep(0.08)
-
-                # close progressively until thresholds reached or aborted
-                while not all(reached.values()) and state == 'closing' and not stop_flag.is_set():
-                    with latest_lock:
-                        fsr_vals = list(latest['fsr'])
-                        temp = latest['temp']
-                    with category_lock:
-                        local_thresholds = list(THRESHOLDS)
-
-                    # safety temp check
-                    if temp >= TEMP_ABORT:
-                        print(f"[SAFETY] Temperature {temp:.1f}°C >= {TEMP_ABORT}°C: aborting and opening.")
-                        with state_lock:
-                            state = 'idle'
-                        # smooth open
-                        servo_ctrl.smooth_open()
-                        break
-
-                    for idx, p in enumerate(finger_pins):
-                        if reached[p]:
-                            continue
-                        val = fsr_vals[idx] if idx < len(fsr_vals) else 0
-                        if val >= local_thresholds[idx]:
-                            reached[p] = True
-                            print(f"[GRIP] finger {idx} reached threshold ({val} >= {local_thresholds[idx]})")
-                            continue
-                        # move the servo a step (per-finger incremental movement)
-                        if cur_angle[p] < CLOSE_ANGLE:
-                            cur_angle[p] = min(CLOSE_ANGLE, cur_angle[p] + STEP_DEG)
-                            servo_ctrl.move_to_angle_by_pin(p, cur_angle[p])
-                    time.sleep(STEP_DELAY)
-
-                with state_lock:
-                    if state == 'closing':
-                        state = 'gripped'
-                        print("[STATE] Gripping done -> state = gripped")
-                    else:
-                        print("[STATE] Closing interrupted; new state:", state)
-
-            elif s == 'gripped':
-                # stay closed until button pressed -> opening (handled by button callback)
-                time.sleep(0.12)
-            else:
-                time.sleep(0.12)
-
-    except Exception as e:
-        print("[ERROR] finger_actuation_loop:", e)
-
-def wrist_elbow_loop(servo_ctrl: SimpleServoController, we_pins, adc_channels):
-    """
-    Read ADS1115 potentiometers and move wrist/elbow servos continuously.
-    """
-    # map raw adc to 0..180 angle
-    def raw_to_angle(raw):
-        # clamp and scale
-        if raw is None:
-            return 90
-        if raw < ADC_RAW_MIN:
-            raw = ADC_RAW_MIN
-        if raw > ADC_RAW_MAX:
-            raw = ADC_RAW_MAX
-        return int((raw - ADC_RAW_MIN) / max(1, (ADC_RAW_MAX - ADC_RAW_MIN)) * 180)
-
-    try:
-        while not stop_flag.is_set():
-            for i, p in enumerate(we_pins):
-                try:
-                    ch = adc_channels[i]
-                    raw = adc.read_adc(ch, gain=1)
-                    angle = raw_to_angle(raw)
-                    servo_ctrl.move_to_angle_by_pin(p, angle)
-                except Exception:
-                    continue
-            time.sleep(0.04)
-    except Exception as e:
-        print("[ERROR] wrist_elbow_loop:", e)
-
-# ---------------- Main ----------------
-def main():
-    global state, button_cb, pi, CURRENT_CATEGORY
-    button_cb = None
-    pi = None
-    CURRENT_CATEGORY = None
-
-    print("NeoArm main starting... (make sure pigpiod is running)")
-
-    # Start serial thread
-    th_serial = threading.Thread(target=serial_thread_fn, args=(SERIAL_PORT, BAUDRATE), daemon=True)
-    th_serial.start()
-    print("[MAIN] Serial thread started.")
-
-    # Start pigpio
-    pi = pigpio.pi()
-    if not pi.connected:
-        print("[MAIN] pigpio not connected. Start pigpiod and retry (sudo pigpiod).")
-        stop_flag.set()
-        return
-
-    # prepare LED pins (outputs, default off)
-    try:
-        pi.set_mode(BLUE_LED_PIN, pigpio.OUTPUT)
-        pi.set_mode(RED_LED_PIN, pigpio.OUTPUT)
-        # ensure off
-        set_indicator(pi, None)
-    except Exception as e:
-        print("[MAIN] LED init error:", e)
-
-    # Setup servo controller
-    servo_ctrl = SimpleServoController(pi, ALL_SERVOS)
-    print("[MAIN] Servo controller initialized. All servos set to OPEN_ANGLE.")
-
-    # Setup button via pigpio callback (avoid RPi.GPIO edge-detect conflicts)
-    try:
-        pi.set_mode(BUTTON_PIN, pigpio.INPUT)
-        pi.set_pull_up_down(BUTTON_PIN, pigpio.PUD_UP)
-
-        # pigpio callback wrapper
-        def _pigpio_button_cb(gpio, level, tick):
-            # level: 0 = falling, 1 = rising, 2 = timeout
-            if level == 0:
-                try:
-                    button_callback(gpio)
-                except Exception as e:
-                    print("[MAIN] button callback error:", e)
-
-        button_cb = pi.callback(BUTTON_PIN, pigpio.FALLING_EDGE, _pigpio_button_cb)
-        print(f"[MAIN] Button set on GPIO{BUTTON_PIN} via pigpio (FALLING -> callback).")
-    except Exception as e:
-        print("[MAIN] Failed to setup button via pigpio:", e)
-        button_cb = None
-
-    # Start category server thread now that pi is available for LED control
-    th_cat = threading.Thread(target=category_server_thread, args=(pi, SERVER_HOST, SERVER_PORT), daemon=True)
-    th_cat.start()
-    print(f"[MAIN] Category server started on {SERVER_HOST}:{SERVER_PORT}")
-
-    # Start actuation threads
-    th_fingers = threading.Thread(target=finger_actuation_loop, args=(servo_ctrl, FINGER_PINS), daemon=True)
-    th_we = threading.Thread(target=wrist_elbow_loop, args=(servo_ctrl, WRIST_ELBOW_PINS, ADC_CHANNELS), daemon=True)
-    th_fingers.start()
-    th_we.start()
-    print("[MAIN] Actuation threads started (fingers, wrist/elbow).")
-
-    # Graceful shutdown handling
-    def shutdown(signum=None, frame=None):
-        print("\n[MAIN] Shutdown signal received. Cleaning up...")
-        stop_flag.set()
-        try:
-            if button_cb is not None:
-                button_cb.cancel()
-        except Exception:
-            pass
-        try:
-            servo_ctrl.cleanup()
-        except Exception:
-            pass
-        try:
-            set_indicator(pi, None)
-        except Exception:
-            pass
-        try:
-            pi.stop()
-        except Exception:
-            pass
-        print("[MAIN] Clean exit.")
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
-
-    # Keep alive
-    try:
-        while True:
-            time.sleep(1.0)
-            # optional: print heartbeat and last serial timestamp
-            # with latest_lock:
-            #     ts = latest.get('last_ts')
-            #     fsr = latest.get('fsr')
-            #     tmp = latest.get('temp')
-            # print(f"[HEART] last serial ts: {ts}, fsr: {fsr}, temp: {tmp}")
-    except SystemExit:
-        pass
-    except Exception as e:
-        print("[MAIN] Unexpected error:", e)
-    finally:
-        shutdown()
-
-if __name__ == "__main__":
-    main()
-
+def force_set_category(cat, pi=None):
+    _apply_category(cat, pi=pi)
