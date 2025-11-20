@@ -1,566 +1,122 @@
-#!/usr/bin/env python3
-"""
-webserver.py - Minimal HTTP server + UI for NeoArm
+import time
+import pigpio
+import board
+import busio
+from adafruit_ina219 import INA219
 
-- Host: 0.0.0.0:8080
-- Serves an attractive single-page UI (embedded HTML/CSS/JS)
-- Endpoints:
-    GET  /            -> serves UI
-    GET  /feedback    -> returns JSON {temperature, palm_pressure, battery_voltage, battery_percent, mode, connected, finger_states}
-    POST /set_mode    -> JSON body {mode: "fsr"|"button"|"wireless"}
-    POST /control     -> JSON body {target: "thumb"|"index_middle"|"ring_pinky"|"all", action: "toggle"|"open"|"close"}
-- Integrates with main.py if importable (calls set_mode, web_open_all, web_close_all).
-- Polls feedback every 500ms on the client.
-"""
+# -------------------
+# CONFIG
+# -------------------
+SERVO_PIN = 17
+PUSH_BUTTON_PIN = 27
 
-import json
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
-import os
+INA_ADDR = 0x40  # finger group INA219
 
-# Try to import main/data hooks if available
-MAIN = None
+# Servo PWM configuration
+SERVO_MIN_US = 500
+SERVO_MAX_US = 2500
+FREQ = 50
+
+# -------------------
+# INIT
+# -------------------
+pi = pigpio.pi()
+if not pi.connected:
+    raise SystemExit("Run: sudo pigpiod")
+
+print(">> Initializing INA219...")
+i2c = busio.I2C(board.SCL, board.SDA)
+ina = INA219(i2c, address=INA_ADDR)
+
+# Setup servo pin
+pi.set_mode(SERVO_PIN, pigpio.OUTPUT)
+
+# Setup button
+pi.set_mode(PUSH_BUTTON_PIN, pigpio.INPUT)
+pi.set_pull_up_down(PUSH_BUTTON_PIN, pigpio.PUD_UP)
+
+# ---------------
+# Helper functions
+# ---------------
+def angle_to_pulse(angle):
+    return SERVO_MIN_US + (SERVO_MAX_US - SERVO_MIN_US) * (angle / 180.0)
+
+def set_angle(angle):
+    pulse = angle_to_pulse(angle)
+    pi.set_servo_pulsewidth(SERVO_PIN, int(pulse))
+
+# ---------------------
+# PRESS TO RUN FUNCTION
+# ---------------------
+def wait_for_button_press():
+    print("\n>> Press the button to START TEST")
+    while pi.read(PUSH_BUTTON_PIN) == 1:
+        time.sleep(0.02)
+    print(">> Button pressed!")
+    time.sleep(0.3)
+
+
+# -------------------------
+# MAIN TEST PROCEDURE
+# -------------------------
+def test_servo_and_current():
+    print("\n========== SERVO + INA219 TEST ==========")
+    print("Sweep range: 0° → 180° → 0°")
+    print("Press against the servo to simulate load.")
+    print("Current values will show here...\n")
+
+    # -----------------
+    # SWEEP UP 0 → 180
+    # -----------------
+    for angle in range(0, 181, 2):
+        set_angle(angle)
+        current = ina.current  # mA
+
+        print(f"Angle: {angle:3d}° | Current: {current:6.1f} mA", end="\r")
+
+        time.sleep(0.03)
+
+    print("\nReached 180°.")
+
+    time.sleep(0.5)
+
+    # -----------------
+    # SWEEP DOWN 180 → 0
+    # -----------------
+    for angle in range(180, -1, -2):
+        set_angle(angle)
+        current = ina.current
+
+        print(f"Angle: {angle:3d}° | Current: {current:6.1f} mA", end="\r")
+
+        time.sleep(0.03)
+
+    print("\nBack to 0°.")
+    print("\n==========================================\n")
+
+
+# -------------------------
+# RUN LOOP
+# -------------------------
 try:
-    import main as controller  # assumes main.py exports set_mode, web_open_all, web_close_all
-    MAIN = controller
-    print("[WEB] main.py imported - will call controller functions directly.")
-except Exception as e:
-    print("[WEB] main.py not importable (or error). Running in fallback mode.", e)
-    MAIN = None
+    print("---- NeoArm Servo-Current Test ----")
+    print("Servo pin:", SERVO_PIN)
+    print("INA219 addr:", hex(INA_ADDR))
+    print("-----------------------------------")
 
-# Try to import data.get_all_feedback for live feedback
-DATA = None
-try:
-    import data as data_layer
-    DATA = data_layer
-    print("[WEB] data.py imported - will read sensor values for /feedback.")
-except Exception as e:
-    print("[WEB] data.py not importable. Feedback will use simulated values.", e)
-    DATA = None
+    set_angle(0)  # start in open position
+    print(">> Servo set to 0° (open)\n")
 
-HOST = "0.0.0.0"
-PORT = 8080
+    while True:
+        wait_for_button_press()
+        test_servo_and_current()
+        print(">> Test complete. Press button again to repeat.")
 
-# Keep a small in-memory state for UI sync (fallback if main not present)
-finger_states = {
-    "thumb": False,
-    "index_middle": False,
-    "ring_pinky": False,
-    "all": False
-}
-current_mode = "button"  # default
+except KeyboardInterrupt:
+    print("\nStopping test...")
 
-def read_feedback():
-    """Return a feedback dict for /feedback endpoint. Uses data.py if available."""
-    global current_mode
-    if DATA:
-        try:
-            fb = DATA.get_all_feedback()
-            temperature = fb.get("temperature", 0)
-            palm_pressure = fb.get("palm_pressure", 0)
-            battery_voltage = fb.get("battery_voltage", 0)
-            battery_percent = fb.get("battery_percent", 0)
-        except Exception:
-            temperature = 0
-            palm_pressure = 0
-            battery_voltage = 0
-            battery_percent = 0
-    else:
-        # simulated fallback values
-        temperature = 30.0
-        palm_pressure = 0.0
-        battery_voltage = 11.1
-        battery_percent = 70.0
-
-    # connected status: true if MAIN controller is importable
-    connected = MAIN is not None
-
-    return {
-        "temperature": round(temperature, 1),
-        "palm_pressure": round(palm_pressure, 1),
-        "battery_voltage": round(battery_voltage, 2),
-        "battery_percent": round(battery_percent, 1),
-        "mode": current_mode,
-        "connected": connected,
-        "finger_states": finger_states
-    }
-
-# ---------------------------
-# HTTP Request Handler
-# ---------------------------
-class NeoArmHandler(BaseHTTPRequestHandler):
-    def _set_headers(self, status=200, mime="application/json"):
-        self.send_response(status)
-        self.send_header('Content-type', mime)
-        # allow cross origin (phone may hit pi IP)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.end_headers()
-
-    def do_OPTIONS(self):
-        self.send_response(200)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
-        self.send_header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS')
-        self.end_headers()
-
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        path = parsed.path
-
-        if path == "/" or path == "/index.html":
-            self._set_headers(200, "text/html")
-            self.wfile.write(HTML_PAGE.encode("utf-8"))
-            return
-
-        if path == "/feedback":
-            fb = read_feedback()
-            self._set_headers(200, "application/json")
-            self.wfile.write(json.dumps(fb).encode("utf-8"))
-            return
-
-        # unknown path
-        self._set_headers(404, "application/json")
-        self.wfile.write(json.dumps({"error": "Not found"}).encode("utf-8"))
-
-    def do_POST(self):
-        parsed = urlparse(self.path)
-        path = parsed.path
-
-        content_length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(content_length) if content_length else b""
-        try:
-            payload = json.loads(body.decode('utf-8')) if body else {}
-        except Exception:
-            payload = {}
-
-        if path == "/set_mode":
-            mode = payload.get("mode")
-            return self._handle_set_mode(mode)
-        if path == "/control":
-            target = payload.get("target")
-            action = payload.get("action")
-            return self._handle_control(target, action)
-
-        self._set_headers(404, "application/json")
-        self.wfile.write(json.dumps({"error": "not found"}).encode("utf-8"))
-
-    def _handle_set_mode(self, mode):
-        global current_mode
-        if mode not in ("fsr", "button", "wireless"):
-            self._set_headers(400)
-            self.wfile.write(json.dumps({"ok": False, "error": "invalid mode"}).encode("utf-8"))
-            return
-        current_mode = mode
-        # call main.set_mode if present
-        ok = True
-        try:
-            if MAIN and hasattr(MAIN, "set_mode"):
-                MAIN.set_mode(mode)
-            # else just set current_mode
-        except Exception as e:
-            ok = False
-            print("[WEB] set_mode error:", e)
-
-        self._set_headers(200)
-        self.wfile.write(json.dumps({"ok": ok, "mode": current_mode}).encode("utf-8"))
-
-    def _handle_control(self, target, action):
-        """
-        target: thumb | index_middle | ring_pinky | all
-        action: toggle | open | close
-        """
-        global finger_states
-
-        if target not in ("thumb", "index_middle", "ring_pinky", "all"):
-            self._set_headers(400)
-            self.wfile.write(json.dumps({"ok": False, "error": "invalid target"}).encode("utf-8"))
-            return
-
-        # map action -> call controller (if present)
-        ok = True
-        try:
-            if MAIN:
-                # call web-friendly functions if available
-                if action == "open":
-                    if target == "all" and hasattr(MAIN, "web_open_all"):
-                        MAIN.web_open_all()
-                    else:
-                        # fallback: call web_open_all for index groups as well
-                        if target == "all" and hasattr(MAIN, "web_open_all"):
-                            MAIN.web_open_all()
-                elif action == "close":
-                    if target == "all" and hasattr(MAIN, "web_close_all"):
-                        MAIN.web_close_all()
-                    else:
-                        # If MAIN doesn't have grouped controls, call close_all as a fallback
-                        if target == "all" and hasattr(MAIN, "web_close_all"):
-                            MAIN.web_close_all()
-                elif action == "toggle":
-                    # toggle is simulated by calling open/close depending on current state
-                    # prefer using web_open_all/web_close_all for all; for per-group, main should provide functions
-                    if target == "all":
-                        if finger_states.get("all"):
-                            if hasattr(MAIN, "web_open_all"):
-                                MAIN.web_open_all()
-                        else:
-                            if hasattr(MAIN, "web_close_all"):
-                                MAIN.web_close_all()
-                    else:
-                        # best-effort: try calling MAIN.handle_trigger_action or MAIN.handle_per_group if available
-                        if hasattr(MAIN, "handle_trigger_action"):
-                            MAIN.handle_trigger_action()
-                        else:
-                            # fallback: flip the state locally
-                            finger_states[target] = not finger_states[target]
-
-            else:
-                # No MAIN — simulate state change locally
-                if action == "toggle":
-                    finger_states[target] = not finger_states.get(target, False)
-                elif action == "open":
-                    finger_states[target] = False
-                elif action == "close":
-                    finger_states[target] = True
-
-        except Exception as e:
-            ok = False
-            print("[WEB] control error:", e)
-
-        self._set_headers(200)
-        # sync local states (for UI) — when MAIN present, UI will get true state from /feedback/read by data layer
-        if target == "all":
-            # when toggling all, sync individual groups too
-            s = finger_states.get("all", False)
-            finger_states["thumb"] = s
-            finger_states["index_middle"] = s
-            finger_states["ring_pinky"] = s
-
-        self.wfile.write(json.dumps({"ok": ok, "target": target, "action": action, "states": finger_states}).encode("utf-8"))
-
-
-# ---------------------------
-# HTML / CSS / JS - single page
-# ---------------------------
-HTML_PAGE = r"""
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>NeoArm Webapplication</title>
-  <style>
-    :root{
-      --bg:#f5f6f8;
-      --card:#ffffff;
-      --accent:#22c55e;
-      --muted:#7b7f86;
-      --panel:#0f1723;
-      --gauge-track:#2b2f33;
-    }
-    body{
-      font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
-      margin:0; padding:0; background:var(--bg); color:#111;
-    }
-    header{
-      padding:18px 16px; display:flex; align-items:center; justify-content:space-between;
-      background:linear-gradient(90deg,#eef2ff, #f8fafc);
-      border-bottom:1px solid #e6eaf0;
-    }
-    h1{ margin:0; font-size:20px; font-weight:700; letter-spacing:0.2px;}
-    .status{
-      display:flex; align-items:center; gap:8px; font-weight:600;
-    }
-    .dot{ width:10px; height:10px; border-radius:50%; background:#ccc; display:inline-block; }
-    .dot.online{ background: #10b981; } /* green */
-    .dot.offline{ background: #111; }
-
-    .container{ padding:18px; max-width:900px; margin:0 auto; }
-
-    .card{ background:var(--card); border-radius:12px; box-shadow:0 6px 18px rgba(9,10,13,0.04); padding:14px; margin-bottom:14px;}
-
-    /* Mode section */
-    .modes{ display:flex; gap:12px; align-items:center; padding:8px; }
-    .modes label{ display:inline-flex; align-items:center; gap:8px; padding:8px 12px; border-radius:8px; background:#f3f4f6; cursor:pointer; }
-    .modes input{ display:none; }
-    .modes input:checked + span{ background:var(--accent); color:#fff; padding:6px 10px; border-radius:6px; }
-
-    /* Control panel */
-    .controls-grid{ display:grid; grid-template-columns: 1fr 1fr; gap:12px; margin-top:10px; }
-    .ctrl-row{ display:flex; align-items:center; justify-content:space-between; gap:16px; }
-    .ctrl-row .label{ font-weight:600; }
-    .btn{
-      min-width:110px; text-align:center; padding:12px 18px; border-radius:10px; border:1px solid #e6eaf0; background:#fff; box-shadow:0 6px 18px rgba(9,10,13,0.03); cursor:pointer; font-weight:700;
-    }
-    .btn.on{ background:var(--accent); color:#fff; border-color: rgba(34,197,94,0.8); }
-
-    /* Feedback gauges */
-    .gauges{ display:flex; gap:12px; flex-wrap:wrap; margin-top:10px; }
-    .gauge{ flex:1 1 260px; background:var(--panel); color:#fff; border-radius:12px; padding:12px; }
-    .gauge h3{ margin:6px 0 12px 0; font-weight:600; color:#d1d5db; text-align:center;}
-    .gauge .big{ font-size:18px; text-align:center; margin-bottom:8px; color:#10b981; font-weight:700;}
-    /* simple circular gauge using conic-gradient */
-    .ring{ height:140px; width:140px; margin:0 auto; border-radius:50%;
-      background: conic-gradient(var(--accent) 0deg, var(--gauge-track) 0deg);
-      display:flex; align-items:center; justify-content:center; color:#fff; position:relative;
-    }
-    .ring .val{ position:absolute; font-weight:700; color:#10b981; }
-    .small-muted{ color:#9aa1a7; font-size:13px; text-align:center; margin-top:8px; }
-
-    footer.note{ text-align:center; padding:10px 6px; color:var(--muted); font-size:13px; }
-
-    @media (max-width:720px){
-      .controls-grid{ grid-template-columns: 1fr; }
-      .gauges{ flex-direction:column; }
-    }
-  </style>
-</head>
-<body>
-  <header>
-    <div><h1>NeoArm Webapplication</h1><div style="font-size:13px;color:var(--muted)">Control & feedback panel</div></div>
-    <div class="status"><span id="status-dot" class="dot offline"></span><span id="status-text">Offline</span></div>
-  </header>
-
-  <div class="container">
-    <!-- Mode selection -->
-    <div class="card">
-      <div style="display:flex; justify-content:space-between; align-items:center;">
-        <div><strong>Mode selection</strong><div style="color:var(--muted);font-size:13px">Choose control mode</div></div>
-      </div>
-      <div class="modes" style="margin-top:10px;">
-        <label><input type="radio" name="mode" value="fsr"><span>FSR</span></label>
-        <label><input type="radio" name="mode" value="button"><span>Push Button</span></label>
-        <label><input type="radio" name="mode" value="wireless"><span>Wireless</span></label>
-      </div>
-    </div>
-
-    <!-- Control panel -->
-    <div class="card">
-      <div style="display:flex; justify-content:space-between; align-items:center;">
-        <div><strong>Control panel</strong><div style="color:var(--muted);font-size:13px">Tap to toggle ON/OFF. Buttons auto-sync after every action.</div></div>
-      </div>
-
-      <div class="controls-grid" id="controls">
-        <div class="ctrl-row card" style="align-items:center;">
-          <div class="label">Thumb</div>
-          <button class="btn" id="btn-thumb" onclick="controlToggle('thumb')">OFF</button>
-        </div>
-
-        <div class="ctrl-row card" style="align-items:center;">
-          <div class="label">Index + Middle</div>
-          <button class="btn" id="btn-index" onclick="controlToggle('index_middle')">OFF</button>
-        </div>
-
-        <div class="ctrl-row card" style="align-items:center;">
-          <div class="label">Ring + Pinky</div>
-          <button class="btn" id="btn-ring" onclick="controlToggle('ring_pinky')">OFF</button>
-        </div>
-
-        <div class="ctrl-row card" style="align-items:center;">
-          <div class="label">All Fingers</div>
-          <button class="btn" id="btn-all" onclick="controlToggle('all')">OFF</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Feedback -->
-    <div class="card">
-      <div style="display:flex; justify-content:space-between; align-items:center;">
-        <div><strong>NeoArm Feedback</strong><div style="color:var(--muted);font-size:13px">Live sensor readings</div></div>
-      </div>
-
-      <div class="gauges">
-        <div class="gauge">
-          <h3>Pressure</h3>
-          <div class="ring" id="g-pressure" style="--pct:0">
-            <div class="val" id="g-pressure-val">0%</div>
-          </div>
-          <div class="small-muted">Palm pressure</div>
-        </div>
-
-        <div class="gauge">
-          <h3>Temperature</h3>
-          <div class="ring" id="g-temp" style="--pct:0">
-            <div class="val" id="g-temp-val">0°C</div>
-          </div>
-          <div class="small-muted">LM35 temperature</div>
-        </div>
-
-        <div class="gauge">
-          <h3>Battery Status</h3>
-          <div class="ring" id="g-batt" style="--pct:0">
-            <div class="val" id="g-batt-val">0%</div>
-          </div>
-          <div class="small-muted">Voltage & percent</div>
-        </div>
-      </div>
-    </div>
-
-    <footer class="note card">Tap a control to toggle. The UI auto-syncs after each action. Connection status is shown top-right.</footer>
-  </div>
-
-<script>
-const API_ROOT = "";
-let pollInterval = 500; // ms
-let polling = null;
-
-// helper to set ring style using rotation / conic gradient
-function setRing(elem, pct, displayText){
-  pct = Math.max(0, Math.min(100, pct));
-  const deg = pct * 3.6; // 100% = 360deg
-  // set background using conic-gradient (accent color then track)
-  elem.style.background = `conic-gradient(#10b981 ${deg}deg, #2b2f33 ${deg}deg)`;
-  const valElem = elem.querySelector('.val') || document.getElementById(elem.id + '-val');
-  if(valElem){
-    valElem.innerHTML = displayText;
-  }
-}
-
-function updateUIFromFeedback(fb){
-  // status
-  const dot = document.getElementById("status-dot");
-  const txt = document.getElementById("status-text");
-  if(fb.connected){
-    dot.classList.remove("offline"); dot.classList.add("online");
-    txt.textContent = "Online";
-  } else {
-    dot.classList.remove("online"); dot.classList.add("offline");
-    txt.textContent = "Offline";
-  }
-
-  // Mode radio
-  const radios = document.getElementsByName("mode");
-  radios.forEach(r=>{
-    r.checked = (r.value === fb.mode);
-  });
-
-  // Control states (buttons)
-  setBtnState("btn-thumb", fb.finger_states.thumb);
-  setBtnState("btn-index", fb.finger_states.index_middle);
-  setBtnState("btn-ring", fb.finger_states.ring_pinky);
-  setBtnState("btn-all", fb.finger_states.all);
-
-  // gauges
-  setRing(document.getElementById("g-pressure"), fb.palm_pressure, `${fb.palm_pressure}%`);
-  setRing(document.getElementById("g-temp"), Math.min(100, fb.temperature), `${fb.temperature}°C`);
-  setRing(document.getElementById("g-batt"), fb.battery_percent, `${fb.battery_percent}%`);
-}
-
-function setBtnState(id, on){
-  const b = document.getElementById(id);
-  if(on){
-    b.classList.add("on");
-    b.textContent = "ON";
-  } else {
-    b.classList.remove("on");
-    b.textContent = "OFF";
-  }
-}
-
-async function fetchFeedback(){
-  try{
-    const r = await fetch(API_ROOT + '/feedback');
-    if(!r.ok) throw "bad";
-    const j = await r.json();
-    updateUIFromFeedback(j);
-  }catch(e){
-    // offline visual
-    document.getElementById("status-dot").classList.remove("online");
-    document.getElementById("status-dot").classList.add("offline");
-    document.getElementById("status-text").textContent = "Offline";
-  }
-}
-
-async function setMode(mode){
-  try{
-    const r = await fetch(API_ROOT + '/set_mode', {
-      method:'POST',
-      headers:{ 'Content-Type':'application/json' },
-      body: JSON.stringify({mode})
-    });
-    const j = await r.json();
-    if(j.ok){
-      // small UI update
-      fetchFeedback();
-    }
-  }catch(e){
-    console.log("setMode error", e);
-  }
-}
-
-async function controlToggle(target){
-  // toggle -> send toggle action (server will reflect new state)
-  await controlAction(target, "toggle");
-}
-
-async function controlAction(target, action){
-  try{
-    const r = await fetch(API_ROOT + '/control', {
-      method:'POST',
-      headers:{ 'Content-Type':'application/json' },
-      body: JSON.stringify({target, action})
-    });
-    const j = await r.json();
-    if(j.ok){
-      // For quick UI feel, flip button immediately, then allow feedback poll to sync
-      // If server returned states, update local
-      if(j.states){
-        updateUIFromFeedback({ ...readLocalFeedback(), finger_states: j.states, mode: document.querySelector('input[name=mode]:checked')?.value || 'button'});
-      }
-    }
-    // sync
-    setTimeout(fetchFeedback, 200);
-  }catch(e){
-    console.log("control error", e);
-  }
-}
-
-// read local feedback from UI if needed
-function readLocalFeedback(){
-  return {
-    palm_pressure: 0,
-    temperature: 0,
-    battery_percent: 0,
-    battery_voltage: 0,
-    mode: document.querySelector('input[name=mode]:checked')?.value || 'button',
-    connected: false,
-    finger_states: {
-      thumb: document.getElementById('btn-thumb').classList.contains('on'),
-      index_middle: document.getElementById('btn-index').classList.contains('on'),
-      ring_pinky: document.getElementById('btn-ring').classList.contains('on'),
-      all: document.getElementById('btn-all').classList.contains('on')
-    }
-  };
-}
-
-// attach mode radio listeners
-document.addEventListener('DOMContentLoaded', function(){
-  document.getElementsByName('mode').forEach(r=>{
-    r.addEventListener('change', function(){
-      setMode(this.value);
-    });
-  });
-
-  // start polling
-  fetchFeedback();
-  polling = setInterval(fetchFeedback, 500);
-});
-</script>
-</body>
-</html>
-"""
-
-# ---------------------------
-# Run server
-# ---------------------------
-def run_server():
-    server = HTTPServer((HOST, PORT), NeoArmHandler)
-    print(f"[WEB] NeoArm webserver running at http://{HOST}:{PORT}")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("[WEB] Stopping server...")
-        server.server_close()
-
-if __name__ == "__main__":
-    run_server()
+finally:
+    print("Resetting servo...")
+    pi.set_servo_pulsewidth(SERVO_PIN, 0)
+    pi.stop()
+    print("Done.")
