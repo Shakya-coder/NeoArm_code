@@ -1,410 +1,566 @@
 #!/usr/bin/env python3
 """
-NeoArm main.py (integrated with category_module)
- - Smooth open/close sweeps for fingers
- - pigpio button callback with software debounce
- - Serial FSR/temp reader, ADS1115 wrist/elbow, pigpio servo PWM
- - Integrates category_module to receive soft/hard/default thresholds
+webserver.py - Minimal HTTP server + UI for NeoArm
+
+- Host: 0.0.0.0:8080
+- Serves an attractive single-page UI (embedded HTML/CSS/JS)
+- Endpoints:
+    GET  /            -> serves UI
+    GET  /feedback    -> returns JSON {temperature, palm_pressure, battery_voltage, battery_percent, mode, connected, finger_states}
+    POST /set_mode    -> JSON body {mode: "fsr"|"button"|"wireless"}
+    POST /control     -> JSON body {target: "thumb"|"index_middle"|"ring_pinky"|"all", action: "toggle"|"open"|"close"}
+- Integrates with main.py if importable (calls set_mode, web_open_all, web_close_all).
+- Polls feedback every 500ms on the client.
 """
-import time
+
+import json
 import threading
-import sys
-import signal
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse, parse_qs
+import os
 
-import pigpio
-import Adafruit_ADS1x15
-import serial
+# Try to import main/data hooks if available
+MAIN = None
+try:
+    import main as controller  # assumes main.py exports set_mode, web_open_all, web_close_all
+    MAIN = controller
+    print("[WEB] main.py imported - will call controller functions directly.")
+except Exception as e:
+    print("[WEB] main.py not importable (or error). Running in fallback mode.", e)
+    MAIN = None
 
-# import the category module (place category_module.py in same folder)
-import category_module
+# Try to import data.get_all_feedback for live feedback
+DATA = None
+try:
+    import data as data_layer
+    DATA = data_layer
+    print("[WEB] data.py imported - will read sensor values for /feedback.")
+except Exception as e:
+    print("[WEB] data.py not importable. Feedback will use simulated values.", e)
+    DATA = None
 
-# ---------------- Config ----------------
-SERIAL_PORT = '/dev/ttyUSB0'
-BAUDRATE = 115200
-SERIAL_TIMEOUT = 1.0  # seconds
+HOST = "0.0.0.0"
+PORT = 8080
 
-FINGER_PINS = [17, 18, 19, 20, 21]      # thumb -> pinky
-WRIST_ELBOW_PINS = [22, 23]             # wrist, elbow
-
-ALL_SERVOS = FINGER_PINS + WRIST_ELBOW_PINS
-
-BUTTON_PIN = 27                          # BCM, wired to GND, use internal pull-up
-BUTTON_DEBOUNCE_S = 0.35                 # ignore presses within 350 ms
-
-OPEN_ANGLE = 0
-CLOSE_ANGLE = 180
-
-STEP_DEG = 3
-STEP_DELAY = 0.04
-
-# Default static thresholds (unused directly — read from category_module)
-# kept for backwards compatibility
-THRESHOLDS = [500, 500, 500, 500, 500]
-
-# Safety temperature: abort gripping and open if temp >= this (°C)
-TEMP_ABORT = 40.0
-
-# ADC (ADS1115) config
-adc = Adafruit_ADS1x15.ADS1115(address=0x48, busnum=1)
-ADC_CHANNELS = [0, 1]   # channel 0 -> wrist pot, channel 1 -> elbow pot
-
-# ADS1115 single-ended raw range (we assume 0..32767 typical)
-ADC_RAW_MIN = 0
-ADC_RAW_MAX = 32767
-
-# servo pulse range (microseconds)
-SERVO_MIN_US = 500
-SERVO_MAX_US = 2500
-
-# LED pins to pass to the module (BCM)
-BLUE_LED_PIN = 5
-RED_LED_PIN = 6
-YELLOW_LED_PIN = None  # set a BCM pin if you have a yellow LED for default
-
-# category revert timeout (seconds)
-CATEGORY_TIMEOUT_S = 40  # revert to default if no new msg in this many seconds
-
-# ---------------- Utilities ----------------
-def angle_to_pulse(a):
-    a = max(0.0, min(180.0, a))
-    return int(SERVO_MIN_US + (SERVO_MAX_US - SERVO_MIN_US) * (a / 180.0))
-
-# ---------------- Servo controller (smooth open/close) ----------------
-class SimpleServoController:
-    def __init__(self, pi: pigpio.pi, pins):
-        self.pi = pi
-        self.pins = list(pins)
-        # current angle dict (float)
-        self.current = {p: float(OPEN_ANGLE) for p in self.pins}
-        # initialize to OPEN_ANGLE pulses
-        for p in self.pins:
-            self.pi.set_servo_pulsewidth(p, angle_to_pulse(OPEN_ANGLE))
-        time.sleep(0.12)
-
-    def _set_angle_immediate(self, pin, angle):
-        # low-level set (int)
-        self.current[pin] = float(angle)
-        self.pi.set_servo_pulsewidth(pin, angle_to_pulse(angle))
-
-    def move_to_angle_by_pin(self, pin, angle):
-        if pin not in self.pins:
-            raise ValueError(f"Pin {pin} not registered in controller")
-        self._set_angle_immediate(pin, angle)
-
-    def stop_all(self):
-        for p in self.pins:
-            try:
-                self.pi.set_servo_pulsewidth(p, 0)
-            except Exception:
-                pass
-
-    def _smooth_move(self, targets: dict, step_deg=STEP_DEG, step_delay=STEP_DELAY):
-        cur = {p: float(self.current.get(p, OPEN_ANGLE)) for p in self.pins}
-        tgs = {p: float(targets.get(p, cur[p])) for p in self.pins}
-        if all(abs(cur[p] - tgs[p]) < 1e-3 for p in self.pins):
-            return
-        max_delta = max(abs(cur[p] - tgs[p]) for p in self.pins)
-        steps = max(1, int(max_delta / max(1e-6, step_deg)))
-        for _ in range(steps):
-            done = True
-            for p in self.pins:
-                if abs(cur[p] - tgs[p]) < 1e-6:
-                    continue
-                done = False
-                if cur[p] < tgs[p]:
-                    cur[p] = min(tgs[p], cur[p] + step_deg)
-                else:
-                    cur[p] = max(tgs[p], cur[p] - step_deg)
-                try:
-                    self.pi.set_servo_pulsewidth(p, angle_to_pulse(cur[p]))
-                    self.current[p] = float(cur[p])
-                except Exception:
-                    pass
-            if done:
-                break
-            time.sleep(step_delay)
-        for p in self.pins:
-            try:
-                self.pi.set_servo_pulsewidth(p, angle_to_pulse(tgs[p]))
-                self.current[p] = float(tgs[p])
-            except Exception:
-                pass
-
-    def smooth_open(self, step_deg=STEP_DEG, step_delay=STEP_DELAY):
-        targets = {p: float(OPEN_ANGLE) for p in self.pins}
-        self._smooth_move(targets, step_deg=step_deg, step_delay=step_delay)
-
-    def smooth_close(self, step_deg=STEP_DEG, step_delay=STEP_DELAY):
-        targets = {p: float(CLOSE_ANGLE) for p in self.pins}
-        self._smooth_move(targets, step_deg=step_deg, step_delay=step_delay)
-
-    def cleanup(self):
-        try:
-            self.smooth_open()
-            time.sleep(0.12)
-            self.stop_all()
-        except Exception:
-            pass
-
-# ---------------- Serial reader thread ----------------
-latest_lock = threading.Lock()
-latest = {
-    'fsr': [0, 0, 0, 0, 0],
-    'temp': 0.0,
-    'last_ts': None
+# Keep a small in-memory state for UI sync (fallback if main not present)
+finger_states = {
+    "thumb": False,
+    "index_middle": False,
+    "ring_pinky": False,
+    "all": False
 }
-stop_flag = threading.Event()
+current_mode = "button"  # default
 
-def serial_thread_fn(port, baud):
-    global latest
-    while not stop_flag.is_set():
+def read_feedback():
+    """Return a feedback dict for /feedback endpoint. Uses data.py if available."""
+    global current_mode
+    if DATA:
         try:
-            with serial.Serial(port, baud, timeout=SERIAL_TIMEOUT) as ser:
-                time.sleep(1.0)
-                ser.reset_input_buffer()
-                while not stop_flag.is_set():
-                    try:
-                        raw = ser.readline()
-                        if not raw:
-                            continue
-                        try:
-                            line = raw.decode('ascii', errors='ignore').strip()
-                        except Exception:
-                            line = raw.decode('latin1', errors='ignore').strip()
-                        if not line:
-                            continue
-                        parts = [p.strip() for p in line.split(',') if p.strip() != '']
-                        if len(parts) >= 6:
-                            try:
-                                fsrs = [int(float(parts[i])) for i in range(5)]
-                                temp = float(parts[5])
-                                with latest_lock:
-                                    latest['fsr'] = fsrs
-                                    latest['temp'] = temp
-                                    latest['last_ts'] = time.time()
-                            except Exception:
-                                pass
-                    except Exception:
-                        continue
+            fb = DATA.get_all_feedback()
+            temperature = fb.get("temperature", 0)
+            palm_pressure = fb.get("palm_pressure", 0)
+            battery_voltage = fb.get("battery_voltage", 0)
+            battery_percent = fb.get("battery_percent", 0)
+        except Exception:
+            temperature = 0
+            palm_pressure = 0
+            battery_voltage = 0
+            battery_percent = 0
+    else:
+        # simulated fallback values
+        temperature = 30.0
+        palm_pressure = 0.0
+        battery_voltage = 11.1
+        battery_percent = 70.0
+
+    # connected status: true if MAIN controller is importable
+    connected = MAIN is not None
+
+    return {
+        "temperature": round(temperature, 1),
+        "palm_pressure": round(palm_pressure, 1),
+        "battery_voltage": round(battery_voltage, 2),
+        "battery_percent": round(battery_percent, 1),
+        "mode": current_mode,
+        "connected": connected,
+        "finger_states": finger_states
+    }
+
+# ---------------------------
+# HTTP Request Handler
+# ---------------------------
+class NeoArmHandler(BaseHTTPRequestHandler):
+    def _set_headers(self, status=200, mime="application/json"):
+        self.send_response(status)
+        self.send_header('Content-type', mime)
+        # allow cross origin (phone may hit pi IP)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.send_header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS')
+        self.end_headers()
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == "/" or path == "/index.html":
+            self._set_headers(200, "text/html")
+            self.wfile.write(HTML_PAGE.encode("utf-8"))
+            return
+
+        if path == "/feedback":
+            fb = read_feedback()
+            self._set_headers(200, "application/json")
+            self.wfile.write(json.dumps(fb).encode("utf-8"))
+            return
+
+        # unknown path
+        self._set_headers(404, "application/json")
+        self.wfile.write(json.dumps({"error": "Not found"}).encode("utf-8"))
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length) if content_length else b""
+        try:
+            payload = json.loads(body.decode('utf-8')) if body else {}
+        except Exception:
+            payload = {}
+
+        if path == "/set_mode":
+            mode = payload.get("mode")
+            return self._handle_set_mode(mode)
+        if path == "/control":
+            target = payload.get("target")
+            action = payload.get("action")
+            return self._handle_control(target, action)
+
+        self._set_headers(404, "application/json")
+        self.wfile.write(json.dumps({"error": "not found"}).encode("utf-8"))
+
+    def _handle_set_mode(self, mode):
+        global current_mode
+        if mode not in ("fsr", "button", "wireless"):
+            self._set_headers(400)
+            self.wfile.write(json.dumps({"ok": False, "error": "invalid mode"}).encode("utf-8"))
+            return
+        current_mode = mode
+        # call main.set_mode if present
+        ok = True
+        try:
+            if MAIN and hasattr(MAIN, "set_mode"):
+                MAIN.set_mode(mode)
+            # else just set current_mode
         except Exception as e:
-            print("[SERIAL] Serial open/read error:", e)
-            time.sleep(2.0)
+            ok = False
+            print("[WEB] set_mode error:", e)
 
-# ---------------- Actuation logic ----------------
-state_lock = threading.Lock()
-state = 'idle'
-_last_button_ts = 0.0
+        self._set_headers(200)
+        self.wfile.write(json.dumps({"ok": ok, "mode": current_mode}).encode("utf-8"))
 
-def _register_button_press():
-    global _last_button_ts
-    now = time.time()
-    if now - _last_button_ts < BUTTON_DEBOUNCE_S:
-        return False
-    _last_button_ts = now
-    return True
+    def _handle_control(self, target, action):
+        """
+        target: thumb | index_middle | ring_pinky | all
+        action: toggle | open | close
+        """
+        global finger_states
 
-def button_callback(pin):
-    global state
-    if not _register_button_press():
-        return
-    with state_lock:
-        if state == 'idle':
-            state = 'closing'
-            print("[BUTTON] Press -> start closing")
-        elif state == 'closing':
-            state = 'idle'
-            print("[BUTTON] Press -> abort/stop (open)")
-        elif state == 'gripped':
-            state = 'idle'
-            print("[BUTTON] Press -> opening")
+        if target not in ("thumb", "index_middle", "ring_pinky", "all"):
+            self._set_headers(400)
+            self.wfile.write(json.dumps({"ok": False, "error": "invalid target"}).encode("utf-8"))
+            return
 
-def finger_actuation_loop(servo_ctrl: SimpleServoController, finger_pins):
-    global state
-    cur_angle = {p: float(OPEN_ANGLE) for p in finger_pins}
-
-    try:
-        while not stop_flag.is_set():
-            with state_lock:
-                s = state
-
-            if s == 'idle':
-                not_open = any(abs(servo_ctrl.current.get(p, OPEN_ANGLE) - OPEN_ANGLE) > 1.0 for p in finger_pins)
-                if not_open:
-                    servo_ctrl.smooth_open()
-                time.sleep(0.12)
-                continue
-
-            if s == 'closing':
-                reached = {p: False for p in finger_pins}
-                for p in finger_pins:
-                    cur_angle[p] = float(OPEN_ANGLE)
-                    servo_ctrl.move_to_angle_by_pin(p, OPEN_ANGLE)
-                time.sleep(0.08)
-
-                while not all(reached.values()) and state == 'closing' and not stop_flag.is_set():
-                    with latest_lock:
-                        fsr_vals = list(latest['fsr'])
-                        temp = latest['temp']
-
-                    # read thresholds from category_module
-                    local_thresholds = category_module.get_thresholds()
-
-                    if temp >= TEMP_ABORT:
-                        print(f"[SAFETY] Temperature {temp:.1f}°C >= {TEMP_ABORT}°C: aborting and opening.")
-                        with state_lock:
-                            state = 'idle'
-                        servo_ctrl.smooth_open()
-                        break
-
-                    for idx, p in enumerate(finger_pins):
-                        if reached[p]:
-                            continue
-                        val = fsr_vals[idx] if idx < len(fsr_vals) else 0
-                        if val >= local_thresholds[idx]:
-                            reached[p] = True
-                            print(f"[GRIP] finger {idx} reached threshold ({val} >= {local_thresholds[idx]})")
-                            continue
-                        if cur_angle[p] < CLOSE_ANGLE:
-                            cur_angle[p] = min(CLOSE_ANGLE, cur_angle[p] + STEP_DEG)
-                            print(f"[MOVE] finger_idx={idx} pin={p} angle -> {cur_angle[p]:.1f}")
-                            servo_ctrl.move_to_angle_by_pin(p, cur_angle[p])
-                    time.sleep(STEP_DELAY)
-
-                with state_lock:
-                    if state == 'closing':
-                        state = 'gripped'
-                        print("[STATE] Gripping done -> state = gripped")
+        # map action -> call controller (if present)
+        ok = True
+        try:
+            if MAIN:
+                # call web-friendly functions if available
+                if action == "open":
+                    if target == "all" and hasattr(MAIN, "web_open_all"):
+                        MAIN.web_open_all()
                     else:
-                        print("[STATE] Closing interrupted; new state:", state)
+                        # fallback: call web_open_all for index groups as well
+                        if target == "all" and hasattr(MAIN, "web_open_all"):
+                            MAIN.web_open_all()
+                elif action == "close":
+                    if target == "all" and hasattr(MAIN, "web_close_all"):
+                        MAIN.web_close_all()
+                    else:
+                        # If MAIN doesn't have grouped controls, call close_all as a fallback
+                        if target == "all" and hasattr(MAIN, "web_close_all"):
+                            MAIN.web_close_all()
+                elif action == "toggle":
+                    # toggle is simulated by calling open/close depending on current state
+                    # prefer using web_open_all/web_close_all for all; for per-group, main should provide functions
+                    if target == "all":
+                        if finger_states.get("all"):
+                            if hasattr(MAIN, "web_open_all"):
+                                MAIN.web_open_all()
+                        else:
+                            if hasattr(MAIN, "web_close_all"):
+                                MAIN.web_close_all()
+                    else:
+                        # best-effort: try calling MAIN.handle_trigger_action or MAIN.handle_per_group if available
+                        if hasattr(MAIN, "handle_trigger_action"):
+                            MAIN.handle_trigger_action()
+                        else:
+                            # fallback: flip the state locally
+                            finger_states[target] = not finger_states[target]
 
-            elif s == 'gripped':
-                time.sleep(0.12)
             else:
-                time.sleep(0.12)
+                # No MAIN — simulate state change locally
+                if action == "toggle":
+                    finger_states[target] = not finger_states.get(target, False)
+                elif action == "open":
+                    finger_states[target] = False
+                elif action == "close":
+                    finger_states[target] = True
 
-    except Exception as e:
-        print("[ERROR] finger_actuation_loop:", e)
+        except Exception as e:
+            ok = False
+            print("[WEB] control error:", e)
 
-def wrist_elbow_loop(servo_ctrl: SimpleServoController, we_pins, adc_channels):
-    def raw_to_angle(raw):
-        if raw is None:
-            return 90
-        if raw < ADC_RAW_MIN:
-            raw = ADC_RAW_MIN
-        if raw > ADC_RAW_MAX:
-            raw = ADC_RAW_MAX
-        return int((raw - ADC_RAW_MIN) / max(1, (ADC_RAW_MAX - ADC_RAW_MIN)) * 180)
+        self._set_headers(200)
+        # sync local states (for UI) — when MAIN present, UI will get true state from /feedback/read by data layer
+        if target == "all":
+            # when toggling all, sync individual groups too
+            s = finger_states.get("all", False)
+            finger_states["thumb"] = s
+            finger_states["index_middle"] = s
+            finger_states["ring_pinky"] = s
 
+        self.wfile.write(json.dumps({"ok": ok, "target": target, "action": action, "states": finger_states}).encode("utf-8"))
+
+
+# ---------------------------
+# HTML / CSS / JS - single page
+# ---------------------------
+HTML_PAGE = r"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>NeoArm Webapplication</title>
+  <style>
+    :root{
+      --bg:#f5f6f8;
+      --card:#ffffff;
+      --accent:#22c55e;
+      --muted:#7b7f86;
+      --panel:#0f1723;
+      --gauge-track:#2b2f33;
+    }
+    body{
+      font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+      margin:0; padding:0; background:var(--bg); color:#111;
+    }
+    header{
+      padding:18px 16px; display:flex; align-items:center; justify-content:space-between;
+      background:linear-gradient(90deg,#eef2ff, #f8fafc);
+      border-bottom:1px solid #e6eaf0;
+    }
+    h1{ margin:0; font-size:20px; font-weight:700; letter-spacing:0.2px;}
+    .status{
+      display:flex; align-items:center; gap:8px; font-weight:600;
+    }
+    .dot{ width:10px; height:10px; border-radius:50%; background:#ccc; display:inline-block; }
+    .dot.online{ background: #10b981; } /* green */
+    .dot.offline{ background: #111; }
+
+    .container{ padding:18px; max-width:900px; margin:0 auto; }
+
+    .card{ background:var(--card); border-radius:12px; box-shadow:0 6px 18px rgba(9,10,13,0.04); padding:14px; margin-bottom:14px;}
+
+    /* Mode section */
+    .modes{ display:flex; gap:12px; align-items:center; padding:8px; }
+    .modes label{ display:inline-flex; align-items:center; gap:8px; padding:8px 12px; border-radius:8px; background:#f3f4f6; cursor:pointer; }
+    .modes input{ display:none; }
+    .modes input:checked + span{ background:var(--accent); color:#fff; padding:6px 10px; border-radius:6px; }
+
+    /* Control panel */
+    .controls-grid{ display:grid; grid-template-columns: 1fr 1fr; gap:12px; margin-top:10px; }
+    .ctrl-row{ display:flex; align-items:center; justify-content:space-between; gap:16px; }
+    .ctrl-row .label{ font-weight:600; }
+    .btn{
+      min-width:110px; text-align:center; padding:12px 18px; border-radius:10px; border:1px solid #e6eaf0; background:#fff; box-shadow:0 6px 18px rgba(9,10,13,0.03); cursor:pointer; font-weight:700;
+    }
+    .btn.on{ background:var(--accent); color:#fff; border-color: rgba(34,197,94,0.8); }
+
+    /* Feedback gauges */
+    .gauges{ display:flex; gap:12px; flex-wrap:wrap; margin-top:10px; }
+    .gauge{ flex:1 1 260px; background:var(--panel); color:#fff; border-radius:12px; padding:12px; }
+    .gauge h3{ margin:6px 0 12px 0; font-weight:600; color:#d1d5db; text-align:center;}
+    .gauge .big{ font-size:18px; text-align:center; margin-bottom:8px; color:#10b981; font-weight:700;}
+    /* simple circular gauge using conic-gradient */
+    .ring{ height:140px; width:140px; margin:0 auto; border-radius:50%;
+      background: conic-gradient(var(--accent) 0deg, var(--gauge-track) 0deg);
+      display:flex; align-items:center; justify-content:center; color:#fff; position:relative;
+    }
+    .ring .val{ position:absolute; font-weight:700; color:#10b981; }
+    .small-muted{ color:#9aa1a7; font-size:13px; text-align:center; margin-top:8px; }
+
+    footer.note{ text-align:center; padding:10px 6px; color:var(--muted); font-size:13px; }
+
+    @media (max-width:720px){
+      .controls-grid{ grid-template-columns: 1fr; }
+      .gauges{ flex-direction:column; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div><h1>NeoArm Webapplication</h1><div style="font-size:13px;color:var(--muted)">Control & feedback panel</div></div>
+    <div class="status"><span id="status-dot" class="dot offline"></span><span id="status-text">Offline</span></div>
+  </header>
+
+  <div class="container">
+    <!-- Mode selection -->
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div><strong>Mode selection</strong><div style="color:var(--muted);font-size:13px">Choose control mode</div></div>
+      </div>
+      <div class="modes" style="margin-top:10px;">
+        <label><input type="radio" name="mode" value="fsr"><span>FSR</span></label>
+        <label><input type="radio" name="mode" value="button"><span>Push Button</span></label>
+        <label><input type="radio" name="mode" value="wireless"><span>Wireless</span></label>
+      </div>
+    </div>
+
+    <!-- Control panel -->
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div><strong>Control panel</strong><div style="color:var(--muted);font-size:13px">Tap to toggle ON/OFF. Buttons auto-sync after every action.</div></div>
+      </div>
+
+      <div class="controls-grid" id="controls">
+        <div class="ctrl-row card" style="align-items:center;">
+          <div class="label">Thumb</div>
+          <button class="btn" id="btn-thumb" onclick="controlToggle('thumb')">OFF</button>
+        </div>
+
+        <div class="ctrl-row card" style="align-items:center;">
+          <div class="label">Index + Middle</div>
+          <button class="btn" id="btn-index" onclick="controlToggle('index_middle')">OFF</button>
+        </div>
+
+        <div class="ctrl-row card" style="align-items:center;">
+          <div class="label">Ring + Pinky</div>
+          <button class="btn" id="btn-ring" onclick="controlToggle('ring_pinky')">OFF</button>
+        </div>
+
+        <div class="ctrl-row card" style="align-items:center;">
+          <div class="label">All Fingers</div>
+          <button class="btn" id="btn-all" onclick="controlToggle('all')">OFF</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Feedback -->
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div><strong>NeoArm Feedback</strong><div style="color:var(--muted);font-size:13px">Live sensor readings</div></div>
+      </div>
+
+      <div class="gauges">
+        <div class="gauge">
+          <h3>Pressure</h3>
+          <div class="ring" id="g-pressure" style="--pct:0">
+            <div class="val" id="g-pressure-val">0%</div>
+          </div>
+          <div class="small-muted">Palm pressure</div>
+        </div>
+
+        <div class="gauge">
+          <h3>Temperature</h3>
+          <div class="ring" id="g-temp" style="--pct:0">
+            <div class="val" id="g-temp-val">0°C</div>
+          </div>
+          <div class="small-muted">LM35 temperature</div>
+        </div>
+
+        <div class="gauge">
+          <h3>Battery Status</h3>
+          <div class="ring" id="g-batt" style="--pct:0">
+            <div class="val" id="g-batt-val">0%</div>
+          </div>
+          <div class="small-muted">Voltage & percent</div>
+        </div>
+      </div>
+    </div>
+
+    <footer class="note card">Tap a control to toggle. The UI auto-syncs after each action. Connection status is shown top-right.</footer>
+  </div>
+
+<script>
+const API_ROOT = "";
+let pollInterval = 500; // ms
+let polling = null;
+
+// helper to set ring style using rotation / conic gradient
+function setRing(elem, pct, displayText){
+  pct = Math.max(0, Math.min(100, pct));
+  const deg = pct * 3.6; // 100% = 360deg
+  // set background using conic-gradient (accent color then track)
+  elem.style.background = `conic-gradient(#10b981 ${deg}deg, #2b2f33 ${deg}deg)`;
+  const valElem = elem.querySelector('.val') || document.getElementById(elem.id + '-val');
+  if(valElem){
+    valElem.innerHTML = displayText;
+  }
+}
+
+function updateUIFromFeedback(fb){
+  // status
+  const dot = document.getElementById("status-dot");
+  const txt = document.getElementById("status-text");
+  if(fb.connected){
+    dot.classList.remove("offline"); dot.classList.add("online");
+    txt.textContent = "Online";
+  } else {
+    dot.classList.remove("online"); dot.classList.add("offline");
+    txt.textContent = "Offline";
+  }
+
+  // Mode radio
+  const radios = document.getElementsByName("mode");
+  radios.forEach(r=>{
+    r.checked = (r.value === fb.mode);
+  });
+
+  // Control states (buttons)
+  setBtnState("btn-thumb", fb.finger_states.thumb);
+  setBtnState("btn-index", fb.finger_states.index_middle);
+  setBtnState("btn-ring", fb.finger_states.ring_pinky);
+  setBtnState("btn-all", fb.finger_states.all);
+
+  // gauges
+  setRing(document.getElementById("g-pressure"), fb.palm_pressure, `${fb.palm_pressure}%`);
+  setRing(document.getElementById("g-temp"), Math.min(100, fb.temperature), `${fb.temperature}°C`);
+  setRing(document.getElementById("g-batt"), fb.battery_percent, `${fb.battery_percent}%`);
+}
+
+function setBtnState(id, on){
+  const b = document.getElementById(id);
+  if(on){
+    b.classList.add("on");
+    b.textContent = "ON";
+  } else {
+    b.classList.remove("on");
+    b.textContent = "OFF";
+  }
+}
+
+async function fetchFeedback(){
+  try{
+    const r = await fetch(API_ROOT + '/feedback');
+    if(!r.ok) throw "bad";
+    const j = await r.json();
+    updateUIFromFeedback(j);
+  }catch(e){
+    // offline visual
+    document.getElementById("status-dot").classList.remove("online");
+    document.getElementById("status-dot").classList.add("offline");
+    document.getElementById("status-text").textContent = "Offline";
+  }
+}
+
+async function setMode(mode){
+  try{
+    const r = await fetch(API_ROOT + '/set_mode', {
+      method:'POST',
+      headers:{ 'Content-Type':'application/json' },
+      body: JSON.stringify({mode})
+    });
+    const j = await r.json();
+    if(j.ok){
+      // small UI update
+      fetchFeedback();
+    }
+  }catch(e){
+    console.log("setMode error", e);
+  }
+}
+
+async function controlToggle(target){
+  // toggle -> send toggle action (server will reflect new state)
+  await controlAction(target, "toggle");
+}
+
+async function controlAction(target, action){
+  try{
+    const r = await fetch(API_ROOT + '/control', {
+      method:'POST',
+      headers:{ 'Content-Type':'application/json' },
+      body: JSON.stringify({target, action})
+    });
+    const j = await r.json();
+    if(j.ok){
+      // For quick UI feel, flip button immediately, then allow feedback poll to sync
+      // If server returned states, update local
+      if(j.states){
+        updateUIFromFeedback({ ...readLocalFeedback(), finger_states: j.states, mode: document.querySelector('input[name=mode]:checked')?.value || 'button'});
+      }
+    }
+    // sync
+    setTimeout(fetchFeedback, 200);
+  }catch(e){
+    console.log("control error", e);
+  }
+}
+
+// read local feedback from UI if needed
+function readLocalFeedback(){
+  return {
+    palm_pressure: 0,
+    temperature: 0,
+    battery_percent: 0,
+    battery_voltage: 0,
+    mode: document.querySelector('input[name=mode]:checked')?.value || 'button',
+    connected: false,
+    finger_states: {
+      thumb: document.getElementById('btn-thumb').classList.contains('on'),
+      index_middle: document.getElementById('btn-index').classList.contains('on'),
+      ring_pinky: document.getElementById('btn-ring').classList.contains('on'),
+      all: document.getElementById('btn-all').classList.contains('on')
+    }
+  };
+}
+
+// attach mode radio listeners
+document.addEventListener('DOMContentLoaded', function(){
+  document.getElementsByName('mode').forEach(r=>{
+    r.addEventListener('change', function(){
+      setMode(this.value);
+    });
+  });
+
+  // start polling
+  fetchFeedback();
+  polling = setInterval(fetchFeedback, 500);
+});
+</script>
+</body>
+</html>
+"""
+
+# ---------------------------
+# Run server
+# ---------------------------
+def run_server():
+    server = HTTPServer((HOST, PORT), NeoArmHandler)
+    print(f"[WEB] NeoArm webserver running at http://{HOST}:{PORT}")
     try:
-        while not stop_flag.is_set():
-            for i, p in enumerate(we_pins):
-                try:
-                    ch = adc_channels[i]
-                    raw = adc.read_adc(ch, gain=1)
-                    angle = raw_to_angle(raw)
-                    servo_ctrl.move_to_angle_by_pin(p, angle)
-                except Exception:
-                    continue
-            time.sleep(0.04)
-    except Exception as e:
-        print("[ERROR] wrist_elbow_loop:", e)
-
-# ---------------- Main ----------------
-def main():
-    global state, button_cb, pi
-    button_cb = None
-    pi = None
-
-    print("NeoArm main starting... (make sure pigpiod is running)")
-
-    # Start serial thread
-    th_serial = threading.Thread(target=serial_thread_fn, args=(SERIAL_PORT, BAUDRATE), daemon=True)
-    th_serial.start()
-    print("[MAIN] Serial thread started.")
-
-    # Start pigpio
-    pi = pigpio.pi()
-    if not pi.connected:
-        print("[MAIN] pigpio not connected. Start pigpiod and retry (sudo pigpiod).")
-        stop_flag.set()
-        return
-
-    # start category module (pass pi and LED pins and timeout)
-    category_module.start(pi,
-                         host="0.0.0.0",
-                         port=9999,
-                         blue_pin=BLUE_LED_PIN,
-                         red_pin=RED_LED_PIN,
-                         yellow_pin=YELLOW_LED_PIN,
-                         timeout_s=CATEGORY_TIMEOUT_S)
-    print("[MAIN] category_module started (listening on 0.0.0.0:9999)")
-
-    # Setup servo controller
-    servo_ctrl = SimpleServoController(pi, ALL_SERVOS)
-    print("[MAIN] Servo controller initialized. All servos set to OPEN_ANGLE.")
-
-    # Setup button via pigpio callback
-    try:
-        pi.set_mode(BUTTON_PIN, pigpio.INPUT)
-        pi.set_pull_up_down(BUTTON_PIN, pigpio.PUD_UP)
-
-        def _pigpio_button_cb(gpio, level, tick):
-            if level == 0:
-                try:
-                    button_callback(gpio)
-                except Exception as e:
-                    print("[MAIN] button callback error:", e)
-
-        button_cb = pi.callback(BUTTON_PIN, pigpio.FALLING_EDGE, _pigpio_button_cb)
-        print(f"[MAIN] Button set on GPIO{BUTTON_PIN} via pigpio (FALLING -> callback).")
-    except Exception as e:
-        print("[MAIN] Failed to setup button via pigpio:", e)
-        button_cb = None
-
-    # Start actuation threads
-    th_fingers = threading.Thread(target=finger_actuation_loop, args=(servo_ctrl, FINGER_PINS), daemon=True)
-    th_we = threading.Thread(target=wrist_elbow_loop, args=(servo_ctrl, WRIST_ELBOW_PINS, ADC_CHANNELS), daemon=True)
-    th_fingers.start()
-    th_we.start()
-    print("[MAIN] Actuation threads started (fingers, wrist/elbow).")
-
-    # Graceful shutdown handling
-    def shutdown(signum=None, frame=None):
-        print("\n[MAIN] Shutdown signal received. Cleaning up...")
-        stop_flag.set()
-        try:
-            if button_cb is not None:
-                button_cb.cancel()
-        except Exception:
-            pass
-        try:
-            servo_ctrl.cleanup()
-        except Exception:
-            pass
-        try:
-            category_module.stop()
-        except Exception:
-            pass
-        try:
-            pi.stop()
-        except Exception:
-            pass
-        print("[MAIN] Clean exit.")
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
-
-    # Keep alive
-    try:
-        while True:
-            time.sleep(1.0)
-    except SystemExit:
-        pass
-    except Exception as e:
-        print("[MAIN] Unexpected error:", e)
-    finally:
-        shutdown()
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("[WEB] Stopping server...")
+        server.server_close()
 
 if __name__ == "__main__":
-    main()
+    run_server()
