@@ -1,87 +1,102 @@
-HTML_PAGE = """
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+# Import your main controller & data modules
+try:
+    import data
+    from main import (
+        thumb_control,
+        index_middle_control,
+        ring_pinky_control,
+        all_fingers_control,
+        set_mode
+    )
+    HW_AVAILABLE = True
+    print("[WEB] Hardware control active.")
+except:
+    HW_AVAILABLE = False
+    print("[WEB] Running in SIMULATION MODE.")
+
+# -------------------------------------------------------------------
+# HTML PAGE (Option C UI)
+# -------------------------------------------------------------------
+PAGE = """
 <!DOCTYPE html>
 <html>
 <head>
-<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NeoArm Webapplication</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
 
 <style>
 body {
-    background:#f7f8fb;
-    font-family:Arial, sans-serif;
-    margin:0;
-    padding:0;
+    font-family: Arial, sans-serif;
+    background: #f5f6fa;
+    margin: 0;
+    padding: 0;
 }
+
 .header {
-    padding:20px;
-    font-size:24px;
-    font-weight:700;
-    background:white;
-    box-shadow:0 2px 4px rgba(0,0,0,0.1);
-    display:flex;
-    justify-content:space-between;
+    padding: 18px;
+    font-size: 22px;
+    font-weight: bold;
+    background: white;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid #ddd;
 }
-.status-dot {
-    width:10px;
-    height:10px;
-    border-radius:50%;
-    background:#00e676;
-    display:inline-block;
+
+.status-online {
+    color: #1cc88a;
+    font-size: 14px;
+    font-weight: bold;
 }
-.card {
-    background:white;
-    margin:15px;
-    padding:20px;
-    border-radius:12px;
-    box-shadow:0 2px 5px rgba(0,0,0,0.08);
+
+.container {
+    padding: 16px;
 }
+
+.section {
+    background: white;
+    padding: 16px;
+    margin-bottom: 15px;
+    border-radius: 10px;
+    border: 1px solid #ddd;
+}
+
 .section-title {
-    font-size:18px;
-    margin-bottom:10px;
-    font-weight:600;
+    font-size: 18px;
+    font-weight: bold;
+    margin-bottom: 12px;
 }
 
-/* Buttons */
-.mode-btn, .control-btn {
-    padding:10px 18px;
-    margin:5px;
-    border-radius:8px;
-    border:1px solid #ccc;
-    background:#fff;
-    font-weight:600;
-}
-.mode-btn.active, .control-btn.active {
-    background:#00c853;
-    color:white;
-    border:1px solid #00c853;
-}
-.control-btn {
-    width:120px;
+.btn {
+    padding: 10px 16px;
+    border-radius: 8px;
+    border: 1px solid #aaa;
+    font-size: 16px;
+    background: white;
+    margin: 5px;
+    min-width: 120px;
 }
 
-.disabled {
-    opacity:0.5;
-    pointer-events:none;
+.btn.active {
+    background: #1cc88a;
+    color: white;
 }
 
-/* GAUGES */
-.gauge-box {
-    background:#1b1d22;
-    padding:20px;
-    border-radius:15px;
-    color:white;
-    width:100%;
-    text-align:center;
-    margin-top:10px;
+.btn-disabled {
+    opacity: 0.4;
+    pointer-events: none;
 }
-.gauge-title {
-    font-size:16px;
-    margin-bottom:10px;
-}
-.gauge-value {
-    font-size:28px;
-    margin-top:10px;
-    color:#1de9b6;
+
+.card {
+    background: #1e1e24;
+    color: white;
+    padding: 14px;
+    margin: 8px 0;
+    border-radius: 10px;
 }
 </style>
 
@@ -90,109 +105,189 @@ body {
 
 <div class="header">
     NeoArm Webapplication
-    <span><span class="status-dot"></span> Online</span>
+    <span class="status-online">● Online</span>
 </div>
 
-<div class="card">
-    <div class="section-title">Mode selection</div>
-    <button class="mode-btn active" id="mode_fsr" onclick="setMode('fsr')">FSR</button>
-    <button class="mode-btn" id="mode_pb" onclick="setMode('push')">Push Button</button>
-    <button class="mode-btn" id="mode_wireless" onclick="setMode('wireless')">Wireless</button>
-</div>
+<div class="container">
 
-<div class="card">
-    <div class="section-title">Control panel</div>
+    <!-- MODE SELECTION -->
+    <div class="section">
+        <div class="section-title">Mode Selection</div>
 
-    <button class="control-btn" id="thumb" onclick="toggleControl('thumb')">OFF</button>
-    <button class="control-btn" id="im" onclick="toggleControl('im')">OFF</button><br>
-
-    <button class="control-btn" id="rp" onclick="toggleControl('rp')">OFF</button>
-    <button class="control-btn" id="all" onclick="toggleControl('all')">OFF</button>
-</div>
-
-<div class="card">
-    <div class="section-title">NeoArm Feedback</div>
-
-    <div class="gauge-box">
-        <div class="gauge-title">Pressure</div>
-        <div class="gauge-value" id="pressure_val">0%</div>
+        <button id="mode_fsr" class="btn" onclick="selectMode('fsr')">FSR</button>
+        <button id="mode_button" class="btn active" onclick="selectMode('button')">Push Button</button>
+        <button id="mode_wireless" class="btn" onclick="selectMode('wireless')">Wireless</button>
     </div>
 
-    <div class="gauge-box">
-        <div class="gauge-title">Temperature</div>
-        <div class="gauge-value" id="temp_val">0°C</div>
+    <!-- CONTROL PANEL -->
+    <div class="section">
+        <div class="section-title">Control Panel</div>
+
+        <button id="thumb" class="btn" onclick="toggleControl('thumb')">OFF</button>
+        <button id="indexmiddle" class="btn" onclick="toggleControl('indexmiddle')">OFF</button>
+        <button id="ringpinky" class="btn" onclick="toggleControl('ringpinky')">OFF</button>
+        <button id="all" class="btn" onclick="toggleControl('all')">OFF</button>
+
     </div>
 
-    <div class="gauge-box">
-        <div class="gauge-title">Battery Status</div>
-        <div class="gauge-value" id="batt_val">0%</div>
+    <!-- FEEDBACK -->
+    <div class="section">
+        <div class="section-title">NeoArm Feedback</div>
+
+        <div class="card">
+            <b>Pressure:</b> <span id="pressure">--</span>%
+        </div>
+
+        <div class="card">
+            <b>Temperature:</b> <span id="temp">--</span>°C
+        </div>
+
+        <div class="card">
+            <b>Battery:</b> 
+            <span id="battp">--</span>% 
+            (<span id="battv">--</span>V)
+        </div>
     </div>
+
 </div>
-
 
 <script>
-// ---------------------
-// MODE SELECTION
-// ---------------------
-let currentMode = "fsr";
 
-function setMode(mode) {
+let currentMode = "button";
+
+// SELECT MODE -------------------------------------------------------
+function selectMode(mode) {
     currentMode = mode;
 
     document.getElementById("mode_fsr").classList.remove("active");
-    document.getElementById("mode_pb").classList.remove("active");
+    document.getElementById("mode_button").classList.remove("active");
     document.getElementById("mode_wireless").classList.remove("active");
 
     document.getElementById("mode_" + mode).classList.add("active");
 
-    // Enable wireless controls ONLY when wireless mode selected
-    if (mode === "wireless") {
-        document.getElementById("thumb").classList.remove("disabled");
-        document.getElementById("im").classList.remove("disabled");
-        document.getElementById("rp").classList.remove("disabled");
-        document.getElementById("all").classList.remove("disabled");
-    } else {
-        // disable manual control when not wireless
-        document.getElementById("thumb").classList.add("disabled");
-        document.getElementById("im").classList.add("disabled");
-        document.getElementById("rp").classList.add("disabled");
-        document.getElementById("all").classList.add("disabled");
+    // Disable controls unless wireless mode
+    let disabled = (mode !== "wireless");
+    document.getElementById("thumb").classList.toggle("btn-disabled", disabled);
+    document.getElementById("indexmiddle").classList.toggle("btn-disabled", disabled);
+    document.getElementById("ringpinky").classList.toggle("btn-disabled", disabled);
+    document.getElementById("all").classList.toggle("btn-disabled", disabled);
+
+    fetch("/mode?set=" + mode);
+}
+
+// CONTROL TOGGLE ----------------------------------------------------
+function toggleControl(part) {
+    fetch("/toggle?part=" + part)
+        .then(response => response.json())
+        .then(updateButtons);
+}
+
+function updateButtons(state) {
+    const mapping = {
+        thumb: "thumb",
+        indexmiddle: "indexmiddle",
+        ringpinky: "ringpinky",
+        all: "all"
+    };
+
+    for (let key in mapping) {
+        let el = document.getElementById(mapping[key]);
+        if (state[key] === 1) {
+            el.classList.add("active");
+            el.innerText = "ON";
+        } else {
+            el.classList.remove("active");
+            el.innerText = "OFF";
+        }
     }
-
-    fetch("/set_mode?mode=" + mode);
 }
 
-// ---------------------
-// CONTROL BUTTONS
-// ---------------------
-function toggleControl(id) {
-    fetch("/control?id=" + id)
-    .then(res => res.json())
-    .then(data => {
-        document.getElementById(id).innerHTML = data.state ? "ON" : "OFF";
-        if (data.state) document.getElementById(id).classList.add("active");
-        else document.getElementById(id).classList.remove("active");
-    });
-}
-
-// ---------------------
-// LIVE FEEDBACK AUTO-UPDATE
-// ---------------------
-function updateFeedback() {
+// AUTO UPDATE FEEDBACK ----------------------------------------------
+function refreshFeedback() {
     fetch("/feedback")
-    .then(res => res.json())
-    .then(data => {
-        document.getElementById("pressure_val").innerHTML = data.palm_pressure + "%";
-        document.getElementById("temp_val").innerHTML = data.temperature + "°C";
-        document.getElementById("batt_val").innerHTML = data.battery_percent + "%";
-    });
+        .then(r => r.json())
+        .then(d => {
+            document.getElementById("pressure").innerText = d.palm_pressure;
+            document.getElementById("temp").innerText = d.temperature;
+            document.getElementById("battp").innerText = d.battery_percent;
+            document.getElementById("battv").innerText = d.battery_voltage;
+        });
 }
 
-// Auto refresh every 1 sec
-setInterval(updateFeedback, 1000);
-
+setInterval(refreshFeedback, 1000);
 </script>
 
 </body>
 </html>
 """
+
+# -------------------------------------------------------------------
+# HTTP SERVER HANDLER
+# -------------------------------------------------------------------
+class Handler(BaseHTTPRequestHandler):
+
+    def _send(self, content):
+        self.send_response(200)
+        self.send_header("Content-type", "text/html")
+        self.end_headers()
+        self.wfile.write(content.encode())
+
+    def do_GET(self):
+        if self.path == "/":
+            self._send(PAGE)
+            return
+
+        # Mode
+        if self.path.startswith("/mode?set="):
+            mode = self.path.split("=")[1]
+            if HW_AVAILABLE:
+                set_mode(mode)
+            self._send("ok")
+            return
+
+        # Toggle controls
+        if self.path.startswith("/toggle?part="):
+            part = self.path.split("=")[1]
+
+            state = {
+                "thumb": 0,
+                "indexmiddle": 0,
+                "ringpinky": 0,
+                "all": 0
+            }
+
+            if HW_AVAILABLE:
+                if part == "thumb":  state["thumb"] = thumb_control()
+                if part == "indexmiddle": state["indexmiddle"] = index_middle_control()
+                if part == "ringpinky": state["ringpinky"] = ring_pinky_control()
+                if part == "all": state["all"] = all_fingers_control()
+
+            self._send(json.dumps(state))
+            return
+
+        # Feedback
+        if self.path == "/feedback":
+            if HW_AVAILABLE:
+                fb = data.get_all_feedback()
+            else:
+                fb = {
+                    "temperature": 30,
+                    "palm_pressure": 10,
+                    "battery_voltage": 11.4,
+                    "battery_percent": 85
+                }
+            self._send(json.dumps(fb))
+            return
+
+
+# -------------------------------------------------------------------
+# START SERVER
+# -------------------------------------------------------------------
+def start_server():
+    server = HTTPServer(("0.0.0.0", 8080), Handler)
+    print("[WEB] NeoArm webserver running at http://0.0.0.0:8080")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    start_server()
