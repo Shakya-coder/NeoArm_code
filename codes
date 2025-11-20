@@ -1,293 +1,433 @@
+#!/usr/bin/env python3
+# webserver.py
+# NeoArm simple web interface (final)
+# Requirements: runs under Python3. Install dependencies in venv:
+# pip install adafruit-circuitpython-... (for real hardware), otherwise runs in simulation.
+
 import json
-import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import unquote
+import threading
+import time
 
-# Import your main controller & data modules
+# Try to import your real modules. If missing, simulate.
 try:
-    import data
-    from main import (
-        thumb_control,
-        index_middle_control,
-        ring_pinky_control,
-        all_fingers_control,
-        set_mode
-    )
-    HW_AVAILABLE = True
-    print("[WEB] Hardware control active.")
-except:
-    HW_AVAILABLE = False
-    print("[WEB] Running in SIMULATION MODE.")
+    import data        # must contain get_all_feedback()
+    import main        # must contain control functions (optional)
+    REAL = True
+    print("[WEB] Real data module loaded.")
+except Exception as e:
+    REAL = False
+    print("[WEB] Running in SIMULATION MODE:", e)
 
-# -------------------------------------------------------------------
-# HTML PAGE (Option C UI)
-# -------------------------------------------------------------------
-PAGE = """
-<!DOCTYPE html>
+# --- internal state ---
+current_mode = "button"   # default: "fsr" | "button" | "wire"
+# button states are booleans: True => ON, False => OFF
+button_states = {
+    "thumb": False,
+    "im": False,
+    "rp": False,
+    "all": False
+}
+
+# helper: set all finger buttons from 'all'
+def set_all_fingers(state: bool):
+    button_states["all"] = state
+    button_states["thumb"] = state
+    button_states["im"] = state
+    button_states["rp"] = state
+
+# Simulated feedback provider (used when REAL==False)
+def simulated_feedback():
+    # rotating example values
+    t = int(time.time()) % 60
+    return {
+        "pressure": (t % 10) * 10,           # 0..90
+        "temperature": 25 + (t % 10) // 2,   # 25..29
+        "battery_percent": 70,
+        "battery_voltage": 11.4
+    }
+
+# --- HTML / JS page (keeps close to your screenshot & behavior) ---
+HTML = """<!doctype html>
 <html>
 <head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>NeoArm Webapplication</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-
 <style>
-body {
-    font-family: Arial, sans-serif;
-    background: #f5f6fa;
-    margin: 0;
-    padding: 0;
+:root{
+  --bg:#f6f7fa;
+  --card:#ffffff;
+  --muted:#9aa0a6;
+  --accent:#2ecc71; /* green */
+  --shadow: 0 8px 16px rgba(18,18,18,0.06);
+  --card-padding:18px;
 }
-
-.header {
-    padding: 18px;
-    font-size: 22px;
-    font-weight: bold;
-    background: white;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    border-bottom: 1px solid #ddd;
-}
-
-.status-online {
-    color: #1cc88a;
-    font-size: 14px;
-    font-weight: bold;
-}
-
-.container {
-    padding: 16px;
-}
-
-.section {
-    background: white;
-    padding: 16px;
-    margin-bottom: 15px;
-    border-radius: 10px;
-    border: 1px solid #ddd;
-}
-
-.section-title {
-    font-size: 18px;
-    font-weight: bold;
-    margin-bottom: 12px;
-}
-
-.btn {
-    padding: 10px 16px;
-    border-radius: 8px;
-    border: 1px solid #aaa;
-    font-size: 16px;
-    background: white;
-    margin: 5px;
-    min-width: 120px;
-}
-
-.btn.active {
-    background: #1cc88a;
-    color: white;
-}
-
-.btn-disabled {
-    opacity: 0.4;
-    pointer-events: none;
-}
-
-.card {
-    background: #1e1e24;
-    color: white;
-    padding: 14px;
-    margin: 8px 0;
-    border-radius: 10px;
+body{font-family:Arial,Helvetica,sans-serif;background:var(--bg);margin:0;color:#111}
+.topbar{background:var(--card);padding:18px;display:flex;justify-content:space-between;align-items:center;box-shadow:var(--shadow)}
+.title{font-weight:700;font-size:20px}
+.status{display:flex;align-items:center;gap:8px;color:#222}
+.dot{width:12px;height:12px;border-radius:999px;background:#00c853;display:inline-block}
+.container{padding:14px;max-width:820px;margin:0 auto}
+.section{background:var(--card);border-radius:12px;padding:var(--card-padding);box-shadow:var(--shadow);margin-bottom:14px}
+.h2{font-size:16px;margin:0 0 12px 0;font-weight:700}
+.mode-row{display:flex;gap:10px;align-items:center}
+.mode-btn{background:#fff;border:1px solid #e6e6e6;padding:10px 16px;border-radius:10px;cursor:pointer;color:#111}
+.mode-btn.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+.control-row{display:flex;flex-direction:column;gap:12px}
+.control-item{display:flex;justify-content:space-between;align-items:center;background:#fff;border-radius:10px;padding:14px;border:1px solid #f0f0f0}
+.control-label{font-size:16px;font-weight:600}
+.control-btn{padding:10px 18px;border-radius:10px;border:1px solid #e6e6e6;background:#fff;cursor:pointer;font-weight:700}
+.control-btn.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+.control-btn.disabled{background:#f3f3f3;color:#999;cursor:default;border-color:#eee}
+.feedback-cards{display:flex;flex-direction:column;gap:12px}
+.card-box{background:#0f1114;color:#fff;padding:22px;border-radius:12px}
+.card-title{font-size:18px;font-weight:700;text-align:center;margin-bottom:12px}
+.card-value{font-size:20px;text-align:center;color:#1de9b6}
+.footer-note{font-size:12px;color:var(--muted);text-align:center;padding:8px}
+@media(min-width:720px){
+  .feedback-cards{flex-direction:row;gap:12px}
+  .card-box{flex:1}
 }
 </style>
-
 </head>
 <body>
-
-<div class="header">
-    NeoArm Webapplication
-    <span class="status-online">â— Online</span>
+<div class="topbar">
+  <div class="title">NeoArm Webapplication<br><span style="font-size:12px;color:var(--muted);font-weight:400">Control & feedback panel</span></div>
+  <div class="status"><span class="dot" id="online_dot"></span><span id="online_text">Online</span></div>
 </div>
 
 <div class="container">
-
-    <!-- MODE SELECTION -->
-    <div class="section">
-        <div class="section-title">Mode Selection</div>
-
-        <button id="mode_fsr" class="btn" onclick="selectMode('fsr')">FSR</button>
-        <button id="mode_button" class="btn active" onclick="selectMode('button')">Push Button</button>
-        <button id="mode_wireless" class="btn" onclick="selectMode('wireless')">Wireless</button>
+  <!-- modes -->
+  <div class="section">
+    <div class="h2">Mode selection</div>
+    <div class="mode-row">
+      <button id="m_fsr" class="mode-btn" onclick="setMode('fsr')">FSR</button>
+      <button id="m_push" class="mode-btn" onclick="setMode('button')">Push Button</button>
+      <button id="m_wire" class="mode-btn" onclick="setMode('wire')">Wireless</button>
     </div>
+  </div>
 
-    <!-- CONTROL PANEL -->
-    <div class="section">
-        <div class="section-title">Control Panel</div>
+  <!-- control panel -->
+  <div class="section">
+    <div class="h2">Control panel</div>
+    <div class="control-row">
+      <div class="control-item">
+        <div class="control-label">Thumb</div>
+        <button id="btn_thumb" class="control-btn" onclick="toggle('thumb')">OFF</button>
+      </div>
 
-        <button id="thumb" class="btn" onclick="toggleControl('thumb')">OFF</button>
-        <button id="indexmiddle" class="btn" onclick="toggleControl('indexmiddle')">OFF</button>
-        <button id="ringpinky" class="btn" onclick="toggleControl('ringpinky')">OFF</button>
-        <button id="all" class="btn" onclick="toggleControl('all')">OFF</button>
+      <div class="control-item">
+        <div class="control-label">Index + Middle</div>
+        <button id="btn_im" class="control-btn" onclick="toggle('im')">OFF</button>
+      </div>
 
+      <div class="control-item">
+        <div class="control-label">Ring + Pinky</div>
+        <button id="btn_rp" class="control-btn" onclick="toggle('rp')">OFF</button>
+      </div>
+
+      <div class="control-item">
+        <div class="control-label">All Fingers</div>
+        <button id="btn_all" class="control-btn" onclick="toggle('all')">OFF</button>
+      </div>
     </div>
+  </div>
 
-    <!-- FEEDBACK -->
-    <div class="section">
-        <div class="section-title">NeoArm Feedback</div>
+  <!-- feedback -->
+  <div class="section">
+    <div class="h2">NeoArm Feedback</div>
+    <div class="feedback-cards">
+      <div class="card-box">
+        <div class="card-title">Pressure</div>
+        <div style="text-align:center" class="card-value" id="fb_pressure">--%</div>
+        <div style="text-align:center;color:#bdbdbd;margin-top:8px">Palm pressure</div>
+      </div>
 
-        <div class="card">
-            <b>Pressure:</b> <span id="pressure">--</span>%
-        </div>
+      <div class="card-box">
+        <div class="card-title">Temperature</div>
+        <div style="text-align:center" class="card-value" id="fb_temp">-- °C</div>
+        <div style="text-align:center;color:#bdbdbd;margin-top:8px">LM35 temperature</div>
+      </div>
 
-        <div class="card">
-            <b>Temperature:</b> <span id="temp">--</span>Â°C
-        </div>
-
-        <div class="card">
-            <b>Battery:</b> 
-            <span id="battp">--</span>% 
-            (<span id="battv">--</span>V)
-        </div>
+      <div class="card-box">
+        <div class="card-title">Battery Status</div>
+        <div style="text-align:center" class="card-value" id="fb_batt_pct">--%</div>
+        <div style="text-align:center;color:#bdbdbd;margin-top:8px" id="fb_batt_v">-- V</div>
+      </div>
     </div>
+  </div>
 
+  <div class="footer-note">Tap a control to toggle. The UI auto-syncs every 1s. Connection status shown top-right.</div>
 </div>
 
 <script>
+let mode = "button"; // default
+let buttonState = {thumb:false, im:false, rp:false, all:false};
 
-let currentMode = "button";
-
-// SELECT MODE -------------------------------------------------------
-function selectMode(mode) {
-    currentMode = mode;
-
-    document.getElementById("mode_fsr").classList.remove("active");
-    document.getElementById("mode_button").classList.remove("active");
-    document.getElementById("mode_wireless").classList.remove("active");
-
-    document.getElementById("mode_" + mode).classList.add("active");
-
-    // Disable controls unless wireless mode
-    let disabled = (mode !== "wireless");
-    document.getElementById("thumb").classList.toggle("btn-disabled", disabled);
-    document.getElementById("indexmiddle").classList.toggle("btn-disabled", disabled);
-    document.getElementById("ringpinky").classList.toggle("btn-disabled", disabled);
-    document.getElementById("all").classList.toggle("btn-disabled", disabled);
-
-    fetch("/mode?set=" + mode);
+// helper to call endpoints
+function api_get(path){
+  return fetch(path, {cache:"no-store"}).then(r => r);
 }
 
-// CONTROL TOGGLE ----------------------------------------------------
-function toggleControl(part) {
-    fetch("/toggle?part=" + part)
-        .then(response => response.json())
-        .then(updateButtons);
+// set mode
+function setMode(m){
+  mode = m;
+  api_get('/mode/' + encodeURIComponent(m)).then(_ => {
+    refreshUI(); // update look
+  }).catch(_ => refreshUI());
 }
 
-function updateButtons(state) {
-    const mapping = {
-        thumb: "thumb",
-        indexmiddle: "indexmiddle",
-        ringpinky: "ringpinky",
-        all: "all"
-    };
+// toggle finger button (on/off)
+function toggle(name){
+  // if wireless mode not selected, the control buttons are disabled
+  // we still allow toggle click in UI but server will decide - to be safe we gate client-side:
+  if(mode !== 'wire'){
+    return;
+  }
 
-    for (let key in mapping) {
-        let el = document.getElementById(mapping[key]);
-        if (state[key] === 1) {
-            el.classList.add("active");
-            el.innerText = "ON";
-        } else {
-            el.classList.remove("active");
-            el.innerText = "OFF";
-        }
+  // decide which endpoint: check current UI state
+  const el = document.getElementById('btn_' + name);
+  const isOn = el.classList.contains('on');
+  const action = isOn ? 'off' : 'on';
+  const route = '/' + name + '/' + action;
+
+  api_get(route)
+    .then(r => r.json())
+    .then(data => {
+      // update states based on returned status (server returns full state)
+      updateButtonsFromState(data);
+    }).catch(err => {
+      // fallback: just flip UI
+      el.classList.toggle('on');
+      el.innerText = el.classList.contains('on') ? 'ON' : 'OFF';
+    });
+}
+
+// update UI buttons from server state object
+function updateButtonsFromState(state){
+  // state should be object with booleans: thumb, im, rp, all
+  ['thumb','im','rp','all'].forEach(k => {
+    const el = document.getElementById('btn_' + k);
+    if(state[k]){
+      el.classList.add('on');
+      el.innerText = 'ON';
+    } else {
+      el.classList.remove('on');
+      el.innerText = 'OFF';
     }
+  });
 }
 
-// AUTO UPDATE FEEDBACK ----------------------------------------------
-function refreshFeedback() {
-    fetch("/feedback")
-        .then(r => r.json())
-        .then(d => {
-            document.getElementById("pressure").innerText = d.palm_pressure;
-            document.getElementById("temp").innerText = d.temperature;
-            document.getElementById("battp").innerText = d.battery_percent;
-            document.getElementById("battv").innerText = d.battery_voltage;
-        });
+// refresh UI and feedback values
+function refreshUI(){
+  // 1) get feedback
+  api_get('/feedback').then(r => r.json()).then(d => {
+    // expect keys: pressure, temperature, battery_percent, battery_voltage
+    document.getElementById('fb_pressure').innerText = d.pressure + '%';
+    document.getElementById('fb_temp').innerText = d.temperature + ' °C';
+    document.getElementById('fb_batt_pct').innerText = d.battery_percent + '%';
+    document.getElementById('fb_batt_v').innerText = d.battery_voltage + ' V';
+    // online dot green
+    document.getElementById('online_dot').style.background = '#00c853';
+    document.getElementById('online_text').innerText = 'Online';
+  }).catch(err => {
+    document.getElementById('online_dot').style.background = '#999';
+    document.getElementById('online_text').innerText = 'Offline';
+  });
+
+  // 2) get current button state & mode from server
+  api_get('/status').then(r => r.json()).then(s => {
+    mode = s.mode || mode;
+    // apply mode highlight
+    document.getElementById('m_fsr').classList.toggle('active', mode === 'fsr');
+    document.getElementById('m_push').classList.toggle('active', mode === 'button');
+    document.getElementById('m_wire').classList.toggle('active', mode === 'wire');
+
+    // update buttons
+    updateButtonsFromState(s.buttons || buttonState);
+
+    // enable/disable controls when not wireless (Option B)
+    const disabled = (mode !== 'wire');
+    ['thumb','im','rp','all'].forEach(k => {
+      const el = document.getElementById('btn_' + k);
+      if(disabled){
+        el.classList.remove('on');
+        el.classList.add('disabled');
+        el.style.pointerEvents = 'none';
+        el.innerText = s.buttons && s.buttons[k] ? 'ON' : 'OFF'; // still show state
+      } else {
+        el.classList.remove('disabled');
+        el.style.pointerEvents = 'auto';
+      }
+    });
+
+  }).catch(err => {
+    // ignore
+  });
 }
 
-setInterval(refreshFeedback, 1000);
+// automatic refresh once per second
+setInterval(refreshUI, 1000);
+window.addEventListener('load', refreshUI);
 </script>
 
 </body>
 </html>
 """
 
-# -------------------------------------------------------------------
-# HTTP SERVER HANDLER
-# -------------------------------------------------------------------
+# ------------------------------------------------------------
+# HTTP handler with routes (mode endpoints, thumb/im/rp/all on/off, feedback)
+# ------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
-
-    def _send(self, content):
-        self.send_response(200)
-        self.send_header("Content-type", "text/html")
+    def _send_text(self, code, text):
+        self.send_response(code)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(content.encode())
+        self.wfile.write(text.encode('utf-8'))
+
+    def _send_json(self, code, obj):
+        j = json.dumps(obj)
+        self.send_response(code)
+        self.send_header("Content-type", "application/json; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(j.encode('utf-8'))
 
     def do_GET(self):
-        if self.path == "/":
-            self._send(PAGE)
+        global current_mode, button_states
+
+        path = unquote(self.path)
+        # serve root
+        if path == "/" or path.startswith("/index"):
+            self.send_response(200)
+            self.send_header("Content-type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(HTML.encode('utf-8'))
             return
 
-        # Mode
-        if self.path.startswith("/mode?set="):
-            mode = self.path.split("=")[1]
-            if HW_AVAILABLE:
-                set_mode(mode)
-            self._send("ok")
-            return
-
-        # Toggle controls
-        if self.path.startswith("/toggle?part="):
-            part = self.path.split("=")[1]
-
-            state = {
-                "thumb": 0,
-                "indexmiddle": 0,
-                "ringpinky": 0,
-                "all": 0
-            }
-
-            if HW_AVAILABLE:
-                if part == "thumb":  state["thumb"] = thumb_control()
-                if part == "indexmiddle": state["indexmiddle"] = index_middle_control()
-                if part == "ringpinky": state["ringpinky"] = ring_pinky_control()
-                if part == "all": state["all"] = all_fingers_control()
-
-            self._send(json.dumps(state))
-            return
-
-        # Feedback
-        if self.path == "/feedback":
-            if HW_AVAILABLE:
-                fb = data.get_all_feedback()
+        # MODE endpoints: /mode/fsr , /mode/button , /mode/wireless
+        if path.startswith("/mode/"):
+            m = path.split("/mode/")[1].lower()
+            if m in ("fsr", "button", "wire"):
+                # store internal mode
+                if m == "wire":
+                    current_mode = "wire"
+                elif m == "button":
+                    current_mode = "button"
+                else:
+                    current_mode = "fsr"
+                # You can add hw call: if REAL: main.set_mode(current_mode)
+                try:
+                    if REAL and hasattr(__import__('main'), 'set_mode'):
+                        import main as _m
+                        try:
+                            _m.set_mode(current_mode)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                self._send_text(200, "OK")
+                return
             else:
-                fb = {
-                    "temperature": 30,
-                    "palm_pressure": 10,
-                    "battery_voltage": 11.4,
-                    "battery_percent": 85
-                }
-            self._send(json.dumps(fb))
+                self._send_text(400, "Invalid mode")
+                return
+
+        # ON/OFF endpoints for thumb/im/rp/all
+        # e.g. /thumb/on , /thumb/off
+        parts = path.strip("/").split("/")
+        if len(parts) == 2 and parts[0] in ("thumb","im","rp","all") and parts[1] in ("on","off"):
+            name = parts[0]
+            action = parts[1]
+            # update state
+            new_state = (action == "on")
+            # If 'all' changed, sync others
+            if name == "all":
+                set_all_fingers(new_state)
+            else:
+                button_states[name] = new_state
+                # if any finger turned off, ensure 'all' becomes False
+                if name in ("thumb","im","rp") and not new_state:
+                    button_states["all"] = False
+                # if all three individual are on, toggle 'all' to true
+                if name in ("thumb","im","rp") and new_state:
+                    if button_states["thumb"] and button_states["im"] and button_states["rp"]:
+                        button_states["all"] = True
+
+            # call hardware functions if available (main.py)
+            if REAL:
+                try:
+                    import main as hw
+                    # map endpoints to hw functions if they exist
+                    # assume hw has e.g. thumb_on(), thumb_off(), im_on(), ...
+                    func_name = f"{name}_{action}"  # e.g. thumb_on
+                    if hasattr(hw, func_name):
+                        getattr(hw, func_name)()
+                except Exception:
+                    pass
+
+            # return current full state so client can update UI
+            self._send_json(200, button_states.copy())
             return
 
+        # FEEDBACK endpoint
+        if path == "/feedback":
+            if REAL:
+                try:
+                    fb = data.get_all_feedback()
+                    # normalize names used by client
+                    resp = {
+                        "pressure": fb.get("palm_pressure") if isinstance(fb, dict) else fb[1],
+                        "temperature": fb.get("temperature") if isinstance(fb, dict) else fb[0],
+                        "battery_percent": fb.get("battery_percent") if isinstance(fb, dict) else fb[3] if isinstance(fb, (list,tuple)) else 0,
+                        "battery_voltage": fb.get("battery_voltage") if isinstance(fb, dict) else 0
+                    }
+                except Exception as e:
+                    # fallback to simulation
+                    resp = simulated_feedback()
+            else:
+                resp = simulated_feedback()
+            self._send_json(200, resp)
+            return
 
-# -------------------------------------------------------------------
-# START SERVER
-# -------------------------------------------------------------------
-def start_server():
-    server = HTTPServer(("0.0.0.0", 8080), Handler)
-    print("[WEB] NeoArm webserver running at http://0.0.0.0:8080")
-    server.serve_forever()
+        # STATUS endpoint (returns mode + button states + feedback summary)
+        if path == "/status":
+            try:
+                if REAL:
+                    fb = data.get_all_feedback()
+                    feedback = {
+                        "pressure": fb.get("palm_pressure"),
+                        "temperature": fb.get("temperature"),
+                        "battery_percent": fb.get("battery_percent"),
+                        "battery_voltage": fb.get("battery_voltage")
+                    }
+                else:
+                    feedback = simulated_feedback()
+            except Exception:
+                feedback = simulated_feedback()
 
+            out = {
+                "mode": current_mode,
+                "buttons": button_states.copy(),
+                "feedback": feedback
+            }
+            self._send_json(200, out)
+            return
+
+        # unknown path
+        self.send_error(404, "Not found: " + path)
+        return
+
+# ------------- start the server -------------
+def run():
+    addr = ("0.0.0.0", 8080)
+    server = HTTPServer(addr, Handler)
+    print(f"[WEB] NeoArm webserver running on http://{addr[0]}:{addr[1]}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[WEB] Shutting down.")
+        server.server_close()
 
 if __name__ == "__main__":
-    start_server()
+    run()
