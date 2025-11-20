@@ -1,11 +1,7 @@
-# data.py
-# NeoArm - Sensor & Module Layer
-# Returns processed values + optional debug prints
-
 import time
 import board
 import busio
-from adafruit_ads1x15.ads1115 import ADS1115, Mode
+from adafruit_ads1x15.ads1115 import ADS1115   # Mode removed in new libs
 from adafruit_ads1x15.analog_in import AnalogIn
 from adafruit_ina219 import INA219
 
@@ -25,11 +21,11 @@ i2c = busio.I2C(board.SCL, board.SDA)
 # -----------------------------
 # ADS1115 #1 → Feedback sensors
 ads1 = ADS1115(i2c, address=0x48)
-ads1.mode = Mode.CONTINUOUS
+ads1.mode = ADS1115.MODE_CONTINUOUS   # FIXED
 
 # ADS1115 #2 → Control sensors
 ads2 = ADS1115(i2c, address=0x49)
-ads2.mode = Mode.CONTINUOUS
+ads2.mode = ADS1115.MODE_CONTINUOUS   # FIXED
 
 # -----------------------------
 # INA219 MODULES
@@ -69,7 +65,7 @@ def get_palm_pressure():
 
 
 # ======================================================
-# BATTERY STATUS (3S LiPo → ADS1 A2)
+# BATTERY STATUS (ADS1 A2)
 # ======================================================
 def get_battery_level():
     chan = AnalogIn(ads1, ADS1115.P2)
@@ -92,7 +88,7 @@ def get_battery_level():
 
 
 # ======================================================
-# TRIGGER FSR (TOGGLE SWITCH → ADS2 A0)
+# TRIGGER FSR (ADS2 A0)
 # ======================================================
 def get_trigger_fsr():
     chan = AnalogIn(ads2, ADS1115.P0)
@@ -108,7 +104,7 @@ def get_trigger_fsr():
 
 
 # ======================================================
-# WRIST POTENTIOMETER (ADS2 A1)
+# WRIST POT (ADS2 A1)
 # ======================================================
 def get_wrist_angle():
     chan = AnalogIn(ads2, ADS1115.P1)
@@ -123,7 +119,7 @@ def get_wrist_angle():
 
 
 # ======================================================
-# ELBOW POTENTIOMETER (ADS2 A2)
+# ELBOW POT (ADS2 A2)
 # ======================================================
 def get_elbow_angle():
     chan = AnalogIn(ads2, ADS1115.P2)
