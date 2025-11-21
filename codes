@@ -1,180 +1,280 @@
 import time
-import board
-import busio
+import threading
+import pigpio
+import RPi.GPIO as GPIO
 
-from adafruit_ads1x15.ads1115 import ADS1115
-from adafruit_ads1x15.analog_in import AnalogIn
-from adafruit_ina219 import INA219
+import data  # your sensor module
 
-DEBUG = True
+REAL = True  # running on actual hardware
 
-# -----------------------------
-# I2C BUS
-# -----------------------------
-i2c = busio.I2C(board.SCL, board.SDA)
+# -------------------------
+# GPIO / SERVO DEFINITIONS
+# -------------------------
 
-# -----------------------------
-# ADS1115 MODULES
-# -----------------------------
-ads1 = ADS1115(i2c, address=0x48)   # feedback sensors: LM35, FSR, Battery
-ads2 = ADS1115(i2c, address=0x49)   # control sensors: FSR trigger + wrist + elbow
+PIN_THUMB = 22
+PIN_IM = 18
+PIN_RP = 17
 
-# -----------------------------
-# INA219 MODULES
-# -----------------------------
-ina_fingers = INA219(i2c, addr=0x40)
-ina_thumb   = INA219(i2c, addr=0x41)
+PIN_WRIST = 23
+PIN_ELBOW = 24
 
+PIN_PUSH = 27  # physical pushbutton input
 
-# ======================================================
-# TEMPERATURE — ADS1 channel 0
-# ======================================================
-def get_temperature():
-    chan = AnalogIn(ads1, 0)
-    temp_c = round(chan.voltage * 100.0, 2)  # LM35: 10mV per Celsius
-    if DEBUG:
-        print("[TEMP]", temp_c, "C")
-    return temp_c
+PIN_LED_R = 5
+PIN_LED_G = 6
+PIN_LED_B = 13
 
+PIN_BUZZ = 26
 
-# ======================================================
-# PALM PRESSURE — ADS1 channel 1
-# ======================================================
-def get_palm_pressure():
-    chan = AnalogIn(ads1, 1)
-    raw = chan.value
-    percent = round((raw / 32767.0) * 100.0, 1)
+# safe max angle
+MAX_ANGLE = 180
+STEP = 3
+STEP_DELAY = 0.015
 
-    if DEBUG:
-        print("[PALM PRESSURE] Raw:", raw, "Percent:", percent)
+# Current threshold for grip stop
+GRIP_THRESHOLD = 150  # mA
 
-    return percent
+# pigpio
+pi = pigpio.pi()
 
+# GPIO setup
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
 
-# ======================================================
-# BATTERY — ADS1 channel 2
-# ======================================================
-def get_battery_level():
-    chan = AnalogIn(ads1, 2)
-    raw_volt = chan.voltage
+GPIO.setup(PIN_LED_R, GPIO.OUT)
+GPIO.setup(PIN_LED_G, GPIO.OUT)
+GPIO.setup(PIN_LED_B, GPIO.OUT)
+GPIO.setup(PIN_BUZZ, GPIO.OUT)
 
-    SCALE = 4.13  # 147k/47k divider
-    batt_voltage = round(raw_volt * SCALE, 2)
-
-    percent = ((batt_voltage - 9.6) / 3.0) * 100
-    percent = max(0, min(100, round(percent, 1)))
-
-    if DEBUG:
-        print("[BATTERY]", batt_voltage, "V", percent, "%")
-
-    return batt_voltage, percent
+# PUSH BUTTON (one side to GPIO27, other to GND)
+GPIO.setup(PIN_PUSH, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
 
-# ======================================================
-# TRIGGER FSR — ADS2 channel 0
-# ======================================================
-def get_trigger_fsr():
-    chan = AnalogIn(ads2, 0)
-    raw = chan.value
-    pressed = raw > 12000
 
-    if DEBUG:
-        print("[FSR TRIGGER] Raw:", raw, "Pressed:", pressed)
+# -------------------------
+# LED / BUZZER HELPERS
+# -------------------------
 
-    return pressed
+def led(r=False, g=False, b=False):
+    GPIO.output(PIN_LED_R, GPIO.HIGH if r else GPIO.LOW)
+    GPIO.output(PIN_LED_G, GPIO.HIGH if g else GPIO.LOW)
+    GPIO.output(PIN_LED_B, GPIO.HIGH if b else GPIO.LOW)
 
 
-# ======================================================
-# WRIST POT — ADS2 channel 1
-# ======================================================
-def get_wrist_angle():
-    raw = AnalogIn(ads2, 1).value
-    pct = round((raw / 32767.0) * 100.0, 1)
-
-    if DEBUG:
-        print("[WRIST POT]", pct, "%")
-
-    return pct
+def buzz(duration=0.1):
+    GPIO.output(PIN_BUZZ, True)
+    time.sleep(duration)
+    GPIO.output(PIN_BUZZ, False)
 
 
-# ======================================================
-# ELBOW POT — ADS2 channel 2
-# ======================================================
-def get_elbow_angle():
-    raw = AnalogIn(ads2, 2).value
-    pct = round((raw / 32767.0) * 100.0, 1)
+# -------------------------
+# SERVO WRITE
+# -------------------------
 
-    if DEBUG:
-        print("[ELBOW POT]", pct, "%")
-
-    return pct
+def servo_write(pin, angle):
+    pulse = 500 + (angle / 180.0) * 2000  # 500–2500 µs
+    pi.set_servo_pulsewidth(pin, pulse)
 
 
-# ======================================================
-# FINGER CURRENT
-# ======================================================
-def get_finger_current():
-    try:
-        c = round(ina_fingers.current, 1)
-    except:
-        c = 0.0
-
-    if DEBUG:
-        print("[FINGER CURRENT]", c, "mA")
-
-    return c
+def servo_off(pin):
+    pi.set_servo_pulsewidth(pin, 0)
 
 
-# ======================================================
-# THUMB CURRENT
-# ======================================================
-def get_thumb_current():
-    try:
-        c = round(ina_thumb.current, 1)
-    except:
-        c = 0.0
+# -------------------------
+# AVERAGED CURRENT READING
+# -------------------------
 
-    if DEBUG:
-        print("[THUMB CURRENT]", c, "mA")
-
-    return c
-
-
-# ======================================================
-# FEEDBACK FOR WEB + OLED
-# ======================================================
-def get_all_feedback():
-    t = get_temperature()
-    p = get_palm_pressure()
-    v, b = get_battery_level()
-
-    return {
-        "temperature": t,
-        "palm_pressure": p,
-        "battery_voltage": v,
-        "battery_percent": b
-    }
-
-
-# ======================================================
-# TEST MODE
-# ======================================================
-if __name__ == "__main__":
-    print("Running sensor test... CTRL+C to stop.\n")
-
-    while True:
+def get_avg_current():
+    vals = []
+    for _ in range(3):
         try:
-            print("\n==== FEEDBACK ====")
-            print("Temperature:", get_temperature(), "C")
-            print("Palm Pressure:", get_palm_pressure(), "%")
-            print("Battery:", get_battery_level())
-            print("Trigger FSR:", get_trigger_fsr())
-            print("Wrist:", get_wrist_angle(), "%")
-            print("Elbow:", get_elbow_angle(), "%")
-            print("Finger Current:", get_finger_current(), "mA")
-            print("Thumb Current:", get_thumb_current(), "mA")
-            time.sleep(1)
+            vals.append(data.get_finger_current())  # reads INA219
+        except:
+            vals.append(0)
+        time.sleep(0.008)
 
-        except KeyboardInterrupt:
-            print("Stopped.")
-            break
+    return sum(vals) / len(vals)
+
+
+# -------------------------
+# CLOSE UNTIL GRIP LOGIC
+# -------------------------
+
+def close_until_grip(pin):
+    """
+    Closes a finger servo until:
+      - threshold crossed → stop early
+      - OR fully closed
+    """
+    for ang in range(0, MAX_ANGLE + 1, STEP):
+        servo_write(pin, ang)
+        time.sleep(STEP_DELAY)
+
+        curr = get_avg_current()
+
+        if curr >= GRIP_THRESHOLD:
+            print(f"[GRIP] Stopped early at {ang}°, current={curr}")
+            buzz(0.05)
+            return True
+
+    return False
+
+
+# -------------------------
+# OPEN FULLY
+# -------------------------
+
+def open_finger(pin):
+    for ang in range(MAX_ANGLE, -1, -STEP):
+        servo_write(pin, ang)
+        time.sleep(STEP_DELAY)
+
+
+# -------------------------
+# GROUP CONTROL
+# -------------------------
+
+def all_close():
+    close_until_grip(PIN_THUMB)
+    close_until_grip(PIN_IM)
+    close_until_grip(PIN_RP)
+
+
+def all_open():
+    open_finger(PIN_THUMB)
+    open_finger(PIN_IM)
+    open_finger(PIN_RP)
+
+
+# -------------------------
+# INDIVIDUAL CONTROLS (for Wireless UI)
+# -------------------------
+
+def thumb_on(): close_until_grip(PIN_THUMB)
+def thumb_off(): open_finger(PIN_THUMB)
+
+def im_on(): close_until_grip(PIN_IM)
+def im_off(): open_finger(PIN_IM)
+
+def rp_on(): close_until_grip(PIN_RP)
+def rp_off(): open_finger(PIN_RP)
+
+def all_on(): all_close()
+def all_off(): all_open()
+
+
+
+# -------------------------
+# MODE MANAGEMENT
+# -------------------------
+
+current_mode = "button"    # default
+push_state = False         # false=open, true=closed from button
+
+
+def set_mode(m):
+    global current_mode
+    current_mode = m
+
+    if m == "fsr":
+        led(r=True, g=True, b=False)  # yellow
+    elif m == "button":
+        led(r=False, g=True, b=False)  # green
+    elif m == "wire":
+        led(r=False, g=False, b=True)  # blue
+
+    print(f"[MAIN] Mode set to: {m}")
+
+
+
+# -------------------------
+# PHYSICAL PUSH BUTTON HANDLER
+# -------------------------
+
+def _handle_push(channel):
+    """Physical button press toggles all fingers."""
+    global push_state
+
+    if current_mode != "button":
+        return
+
+    # falling = pressed
+    if push_state is False:
+        print("[BTN] Close fingers (push)")
+        all_close()
+        push_state = True
+    else:
+        print("[BTN] Open fingers (push)")
+        all_open()
+        push_state = False
+    
+
+GPIO.add_event_detect(PIN_PUSH, GPIO.FALLING,
+                      callback=_handle_push, bouncetime=250)
+
+
+
+# -------------------------
+# WRIST + ELBOW THREAD
+# -------------------------
+
+def joint_loop():
+    """Continuous movement for elbow & wrist using potentiometer."""
+    while True:
+        if REAL:
+            wrist_percent = data.get_wrist_angle()
+            elbow_percent = data.get_elbow_angle()
+        else:
+            wrist_percent = 50
+            elbow_percent = 50
+
+        servo_write(PIN_WRIST, int((wrist_percent / 100) * 180))
+        servo_write(PIN_ELBOW, int((elbow_percent / 100) * 180))
+
+        time.sleep(0.05)
+
+
+threading.Thread(target=joint_loop, daemon=True).start()
+
+
+
+# -------------------------
+# FSR MODE THREAD
+# -------------------------
+
+def fsr_loop():
+    """FSR-based auto-grip mode."""
+    while True:
+        if current_mode == "fsr":
+            pressed = data.get_trigger_fsr()
+            if pressed:
+                all_close()
+            else:
+                all_open()
+        time.sleep(0.05)
+
+
+threading.Thread(target=fsr_loop, daemon=True).start()
+
+
+
+# -------------------------
+# MAIN LOOP
+# -------------------------
+
+if __name__ == "__main__":
+    print("[MAIN] NeoArm control running...")
+    set_mode(current_mode)
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("[MAIN] Shutting down...")
+        servo_off(PIN_THUMB)
+        servo_off(PIN_IM)
+        servo_off(PIN_RP)
+        servo_off(PIN_WRIST)
+        servo_off(PIN_ELBOW)
+        GPIO.cleanup()
+        pi.stop()
