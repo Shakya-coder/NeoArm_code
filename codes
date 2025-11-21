@@ -1,433 +1,141 @@
-#!/usr/bin/env python3
-# webserver.py
-# NeoArm simple web interface (final)
-# Requirements: runs under Python3. Install dependencies in venv:
-# pip install adafruit-circuitpython-... (for real hardware), otherwise runs in simulation.
-
-import json
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import unquote
-import threading
 import time
+import board
+import busio
+from adafruit_ads1x15.ads1115 import ADS1115
+from adafruit_ads1x15.analog_in import AnalogIn
+from adafruit_ina219 import INA219
 
-# Try to import your real modules. If missing, simulate.
-try:
-    import data        # must contain get_all_feedback()
-    import main        # must contain control functions (optional)
-    REAL = True
-    print("[WEB] Real data module loaded.")
-except Exception as e:
-    REAL = False
-    print("[WEB] Running in SIMULATION MODE:", e)
+# -----------------------------
+# DEBUG MODE (print live values)
+# -----------------------------
+DEBUG = True
 
-# --- internal state ---
-current_mode = "button"   # default: "fsr" | "button" | "wire"
-# button states are booleans: True => ON, False => OFF
-button_states = {
-    "thumb": False,
-    "im": False,
-    "rp": False,
-    "all": False
-}
+# -----------------------------
+# I2C BUS
+# -----------------------------
+i2c = busio.I2C(board.SCL, board.SDA)
 
-# helper: set all finger buttons from 'all'
-def set_all_fingers(state: bool):
-    button_states["all"] = state
-    button_states["thumb"] = state
-    button_states["im"] = state
-    button_states["rp"] = state
+# -----------------------------
+# ADS1115 MODULES
+# -----------------------------
+ads1 = ADS1115(i2c, address=0x48)  # feedback sensors
+ads2 = ADS1115(i2c, address=0x49)  # control sensors
 
-# Simulated feedback provider (used when REAL==False)
-def simulated_feedback():
-    # rotating example values
-    t = int(time.time()) % 60
-    return {
-        "pressure": (t % 10) * 10,           # 0..90
-        "temperature": 25 + (t % 10) // 2,   # 25..29
-        "battery_percent": 70,
-        "battery_voltage": 11.4
-    }
+# -----------------------------
+# INA219 MODULES
+# -----------------------------
+ina_fingers = INA219(i2c, address=0x40)
+ina_thumb   = INA219(i2c, address=0x41)
 
-# --- HTML / JS page (keeps close to your screenshot & behavior) ---
-HTML = """<!doctype html>
-<html>
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>NeoArm Webapplication</title>
-<style>
-:root{
-  --bg:#f6f7fa;
-  --card:#ffffff;
-  --muted:#9aa0a6;
-  --accent:#2ecc71; /* green */
-  --shadow: 0 8px 16px rgba(18,18,18,0.06);
-  --card-padding:18px;
-}
-body{font-family:Arial,Helvetica,sans-serif;background:var(--bg);margin:0;color:#111}
-.topbar{background:var(--card);padding:18px;display:flex;justify-content:space-between;align-items:center;box-shadow:var(--shadow)}
-.title{font-weight:700;font-size:20px}
-.status{display:flex;align-items:center;gap:8px;color:#222}
-.dot{width:12px;height:12px;border-radius:999px;background:#00c853;display:inline-block}
-.container{padding:14px;max-width:820px;margin:0 auto}
-.section{background:var(--card);border-radius:12px;padding:var(--card-padding);box-shadow:var(--shadow);margin-bottom:14px}
-.h2{font-size:16px;margin:0 0 12px 0;font-weight:700}
-.mode-row{display:flex;gap:10px;align-items:center}
-.mode-btn{background:#fff;border:1px solid #e6e6e6;padding:10px 16px;border-radius:10px;cursor:pointer;color:#111}
-.mode-btn.active{background:var(--accent);color:#fff;border-color:var(--accent)}
-.control-row{display:flex;flex-direction:column;gap:12px}
-.control-item{display:flex;justify-content:space-between;align-items:center;background:#fff;border-radius:10px;padding:14px;border:1px solid #f0f0f0}
-.control-label{font-size:16px;font-weight:600}
-.control-btn{padding:10px 18px;border-radius:10px;border:1px solid #e6e6e6;background:#fff;cursor:pointer;font-weight:700}
-.control-btn.on{background:var(--accent);color:#fff;border-color:var(--accent)}
-.control-btn.disabled{background:#f3f3f3;color:#999;cursor:default;border-color:#eee}
-.feedback-cards{display:flex;flex-direction:column;gap:12px}
-.card-box{background:#0f1114;color:#fff;padding:22px;border-radius:12px}
-.card-title{font-size:18px;font-weight:700;text-align:center;margin-bottom:12px}
-.card-value{font-size:20px;text-align:center;color:#1de9b6}
-.footer-note{font-size:12px;color:var(--muted);text-align:center;padding:8px}
-@media(min-width:720px){
-  .feedback-cards{flex-direction:row;gap:12px}
-  .card-box{flex:1}
-}
-</style>
-</head>
-<body>
-<div class="topbar">
-  <div class="title">NeoArm Webapplication<br><span style="font-size:12px;color:var(--muted);font-weight:400">Control & feedback panel</span></div>
-  <div class="status"><span class="dot" id="online_dot"></span><span id="online_text">Online</span></div>
-</div>
+# ======================================================
+# TEMPERATURE (LM35 on ADS1 A0)
+# ======================================================
+def get_temperature():
+    chan = AnalogIn(ads1, ADS1115.P0)
+    voltage = chan.voltage
+    temp_c = round(voltage * 100, 2)  # LM35 = 10mV per deg C
+    if DEBUG:
+        print("[TEMP] {} C".format(temp_c))
+    return temp_c
 
-<div class="container">
-  <!-- modes -->
-  <div class="section">
-    <div class="h2">Mode selection</div>
-    <div class="mode-row">
-      <button id="m_fsr" class="mode-btn" onclick="setMode('fsr')">FSR</button>
-      <button id="m_push" class="mode-btn" onclick="setMode('button')">Push Button</button>
-      <button id="m_wire" class="mode-btn" onclick="setMode('wire')">Wireless</button>
-    </div>
-  </div>
+# ======================================================
+# PALM PRESSURE (FSR on ADS1 A1)
+# ======================================================
+def get_palm_pressure():
+    chan = AnalogIn(ads1, ADS1115.P1)
+    raw = chan.value
+    percent = round((raw / 32767.0) * 100.0, 1)
+    if DEBUG:
+        print("[PALM PRESSURE] Raw={}  Percent={}%".format(raw, percent))
+    return percent
 
-  <!-- control panel -->
-  <div class="section">
-    <div class="h2">Control panel</div>
-    <div class="control-row">
-      <div class="control-item">
-        <div class="control-label">Thumb</div>
-        <button id="btn_thumb" class="control-btn" onclick="toggle('thumb')">OFF</button>
-      </div>
+# ======================================================
+# BATTERY STATUS (ADS1 A2)
+# ======================================================
+def get_battery_level():
+    chan = AnalogIn(ads1, ADS1115.P2)
+    raw_volt = chan.voltage
 
-      <div class="control-item">
-        <div class="control-label">Index + Middle</div>
-        <button id="btn_im" class="control-btn" onclick="toggle('im')">OFF</button>
-      </div>
+    # Divider: 147k / 47k => scale factor ~4.13
+    batt_voltage = round(raw_volt * 4.13, 2)
 
-      <div class="control-item">
-        <div class="control-label">Ring + Pinky</div>
-        <button id="btn_rp" class="control-btn" onclick="toggle('rp')">OFF</button>
-      </div>
+    # 3S LiPo: 9.6 to 12.6V
+    percent = (batt_voltage - 9.6) / 3.0 * 100.0
+    percent = max(0, min(100, round(percent, 1)))
 
-      <div class="control-item">
-        <div class="control-label">All Fingers</div>
-        <button id="btn_all" class="control-btn" onclick="toggle('all')">OFF</button>
-      </div>
-    </div>
-  </div>
+    if DEBUG:
+        print("[BATTERY] {} V   {} %".format(batt_voltage, percent))
 
-  <!-- feedback -->
-  <div class="section">
-    <div class="h2">NeoArm Feedback</div>
-    <div class="feedback-cards">
-      <div class="card-box">
-        <div class="card-title">Pressure</div>
-        <div style="text-align:center" class="card-value" id="fb_pressure">--%</div>
-        <div style="text-align:center;color:#bdbdbd;margin-top:8px">Palm pressure</div>
-      </div>
+    return batt_voltage, percent
 
-      <div class="card-box">
-        <div class="card-title">Temperature</div>
-        <div style="text-align:center" class="card-value" id="fb_temp">-- °C</div>
-        <div style="text-align:center;color:#bdbdbd;margin-top:8px">LM35 temperature</div>
-      </div>
+# ======================================================
+# TRIGGER FSR (ADS2 A0)
+# ======================================================
+def get_trigger_fsr():
+    chan = AnalogIn(ads2, ADS1115.P0)
+    raw = chan.value
+    pressed = raw > 12000
+    if DEBUG:
+        print("[FSR TRIGGER] Raw={} Pressed={}".format(raw, pressed))
+    return pressed
 
-      <div class="card-box">
-        <div class="card-title">Battery Status</div>
-        <div style="text-align:center" class="card-value" id="fb_batt_pct">--%</div>
-        <div style="text-align:center;color:#bdbdbd;margin-top:8px" id="fb_batt_v">-- V</div>
-      </div>
-    </div>
-  </div>
+# ======================================================
+# WRIST POT (ADS2 A1)
+# ======================================================
+def get_wrist_angle():
+    chan = AnalogIn(ads2, ADS1115.P1)
+    raw = chan.value
+    percent = round((raw / 32767.0) * 100.0, 1)
+    if DEBUG:
+        print("[WRIST POT] Raw={} Percent={}%".format(raw, percent))
+    return percent
 
-  <div class="footer-note">Tap a control to toggle. The UI auto-syncs every 1s. Connection status shown top-right.</div>
-</div>
+# ======================================================
+# ELBOW POT (ADS2 A2)
+# ======================================================
+def get_elbow_angle():
+    chan = AnalogIn(ads2, ADS1115.P2)
+    raw = chan.value
+    percent = round((raw / 32767.0) * 100.0, 1)
+    if DEBUG:
+        print("[ELBOW POT] Raw={} Percent={}%".format(raw, percent))
+    return percent
 
-<script>
-let mode = "button"; // default
-let buttonState = {thumb:false, im:false, rp:false, all:false};
-
-// helper to call endpoints
-function api_get(path){
-  return fetch(path, {cache:"no-store"}).then(r => r);
-}
-
-// set mode
-function setMode(m){
-  mode = m;
-  api_get('/mode/' + encodeURIComponent(m)).then(_ => {
-    refreshUI(); // update look
-  }).catch(_ => refreshUI());
-}
-
-// toggle finger button (on/off)
-function toggle(name){
-  // if wireless mode not selected, the control buttons are disabled
-  // we still allow toggle click in UI but server will decide - to be safe we gate client-side:
-  if(mode !== 'wire'){
-    return;
-  }
-
-  // decide which endpoint: check current UI state
-  const el = document.getElementById('btn_' + name);
-  const isOn = el.classList.contains('on');
-  const action = isOn ? 'off' : 'on';
-  const route = '/' + name + '/' + action;
-
-  api_get(route)
-    .then(r => r.json())
-    .then(data => {
-      // update states based on returned status (server returns full state)
-      updateButtonsFromState(data);
-    }).catch(err => {
-      // fallback: just flip UI
-      el.classList.toggle('on');
-      el.innerText = el.classList.contains('on') ? 'ON' : 'OFF';
-    });
-}
-
-// update UI buttons from server state object
-function updateButtonsFromState(state){
-  // state should be object with booleans: thumb, im, rp, all
-  ['thumb','im','rp','all'].forEach(k => {
-    const el = document.getElementById('btn_' + k);
-    if(state[k]){
-      el.classList.add('on');
-      el.innerText = 'ON';
-    } else {
-      el.classList.remove('on');
-      el.innerText = 'OFF';
-    }
-  });
-}
-
-// refresh UI and feedback values
-function refreshUI(){
-  // 1) get feedback
-  api_get('/feedback').then(r => r.json()).then(d => {
-    // expect keys: pressure, temperature, battery_percent, battery_voltage
-    document.getElementById('fb_pressure').innerText = d.pressure + '%';
-    document.getElementById('fb_temp').innerText = d.temperature + ' °C';
-    document.getElementById('fb_batt_pct').innerText = d.battery_percent + '%';
-    document.getElementById('fb_batt_v').innerText = d.battery_voltage + ' V';
-    // online dot green
-    document.getElementById('online_dot').style.background = '#00c853';
-    document.getElementById('online_text').innerText = 'Online';
-  }).catch(err => {
-    document.getElementById('online_dot').style.background = '#999';
-    document.getElementById('online_text').innerText = 'Offline';
-  });
-
-  // 2) get current button state & mode from server
-  api_get('/status').then(r => r.json()).then(s => {
-    mode = s.mode || mode;
-    // apply mode highlight
-    document.getElementById('m_fsr').classList.toggle('active', mode === 'fsr');
-    document.getElementById('m_push').classList.toggle('active', mode === 'button');
-    document.getElementById('m_wire').classList.toggle('active', mode === 'wire');
-
-    // update buttons
-    updateButtonsFromState(s.buttons || buttonState);
-
-    // enable/disable controls when not wireless (Option B)
-    const disabled = (mode !== 'wire');
-    ['thumb','im','rp','all'].forEach(k => {
-      const el = document.getElementById('btn_' + k);
-      if(disabled){
-        el.classList.remove('on');
-        el.classList.add('disabled');
-        el.style.pointerEvents = 'none';
-        el.innerText = s.buttons && s.buttons[k] ? 'ON' : 'OFF'; // still show state
-      } else {
-        el.classList.remove('disabled');
-        el.style.pointerEvents = 'auto';
-      }
-    });
-
-  }).catch(err => {
-    // ignore
-  });
-}
-
-// automatic refresh once per second
-setInterval(refreshUI, 1000);
-window.addEventListener('load', refreshUI);
-</script>
-
-</body>
-</html>
-"""
-
-# ------------------------------------------------------------
-# HTTP handler with routes (mode endpoints, thumb/im/rp/all on/off, feedback)
-# ------------------------------------------------------------
-class Handler(BaseHTTPRequestHandler):
-    def _send_text(self, code, text):
-        self.send_response(code)
-        self.send_header("Content-type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(text.encode('utf-8'))
-
-    def _send_json(self, code, obj):
-        j = json.dumps(obj)
-        self.send_response(code)
-        self.send_header("Content-type", "application/json; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(j.encode('utf-8'))
-
-    def do_GET(self):
-        global current_mode, button_states
-
-        path = unquote(self.path)
-        # serve root
-        if path == "/" or path.startswith("/index"):
-            self.send_response(200)
-            self.send_header("Content-type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(HTML.encode('utf-8'))
-            return
-
-        # MODE endpoints: /mode/fsr , /mode/button , /mode/wireless
-        if path.startswith("/mode/"):
-            m = path.split("/mode/")[1].lower()
-            if m in ("fsr", "button", "wire"):
-                # store internal mode
-                if m == "wire":
-                    current_mode = "wire"
-                elif m == "button":
-                    current_mode = "button"
-                else:
-                    current_mode = "fsr"
-                # You can add hw call: if REAL: main.set_mode(current_mode)
-                try:
-                    if REAL and hasattr(__import__('main'), 'set_mode'):
-                        import main as _m
-                        try:
-                            _m.set_mode(current_mode)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                self._send_text(200, "OK")
-                return
-            else:
-                self._send_text(400, "Invalid mode")
-                return
-
-        # ON/OFF endpoints for thumb/im/rp/all
-        # e.g. /thumb/on , /thumb/off
-        parts = path.strip("/").split("/")
-        if len(parts) == 2 and parts[0] in ("thumb","im","rp","all") and parts[1] in ("on","off"):
-            name = parts[0]
-            action = parts[1]
-            # update state
-            new_state = (action == "on")
-            # If 'all' changed, sync others
-            if name == "all":
-                set_all_fingers(new_state)
-            else:
-                button_states[name] = new_state
-                # if any finger turned off, ensure 'all' becomes False
-                if name in ("thumb","im","rp") and not new_state:
-                    button_states["all"] = False
-                # if all three individual are on, toggle 'all' to true
-                if name in ("thumb","im","rp") and new_state:
-                    if button_states["thumb"] and button_states["im"] and button_states["rp"]:
-                        button_states["all"] = True
-
-            # call hardware functions if available (main.py)
-            if REAL:
-                try:
-                    import main as hw
-                    # map endpoints to hw functions if they exist
-                    # assume hw has e.g. thumb_on(), thumb_off(), im_on(), ...
-                    func_name = f"{name}_{action}"  # e.g. thumb_on
-                    if hasattr(hw, func_name):
-                        getattr(hw, func_name)()
-                except Exception:
-                    pass
-
-            # return current full state so client can update UI
-            self._send_json(200, button_states.copy())
-            return
-
-        # FEEDBACK endpoint
-        if path == "/feedback":
-            if REAL:
-                try:
-                    fb = data.get_all_feedback()
-                    # normalize names used by client
-                    resp = {
-                        "pressure": fb.get("palm_pressure") if isinstance(fb, dict) else fb[1],
-                        "temperature": fb.get("temperature") if isinstance(fb, dict) else fb[0],
-                        "battery_percent": fb.get("battery_percent") if isinstance(fb, dict) else fb[3] if isinstance(fb, (list,tuple)) else 0,
-                        "battery_voltage": fb.get("battery_voltage") if isinstance(fb, dict) else 0
-                    }
-                except Exception as e:
-                    # fallback to simulation
-                    resp = simulated_feedback()
-            else:
-                resp = simulated_feedback()
-            self._send_json(200, resp)
-            return
-
-        # STATUS endpoint (returns mode + button states + feedback summary)
-        if path == "/status":
-            try:
-                if REAL:
-                    fb = data.get_all_feedback()
-                    feedback = {
-                        "pressure": fb.get("palm_pressure"),
-                        "temperature": fb.get("temperature"),
-                        "battery_percent": fb.get("battery_percent"),
-                        "battery_voltage": fb.get("battery_voltage")
-                    }
-                else:
-                    feedback = simulated_feedback()
-            except Exception:
-                feedback = simulated_feedback()
-
-            out = {
-                "mode": current_mode,
-                "buttons": button_states.copy(),
-                "feedback": feedback
-            }
-            self._send_json(200, out)
-            return
-
-        # unknown path
-        self.send_error(404, "Not found: " + path)
-        return
-
-# ------------- start the server -------------
-def run():
-    addr = ("0.0.0.0", 8080)
-    server = HTTPServer(addr, Handler)
-    print(f"[WEB] NeoArm webserver running on http://{addr[0]}:{addr[1]}")
+# ======================================================
+# FINGER GROUP CURRENT (INA219)
+# ======================================================
+def get_finger_current():
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\n[WEB] Shutting down.")
-        server.server_close()
+        current = round(ina_fingers.current, 1)
+    except:
+        current = 0.0
+    if DEBUG:
+        print("[FINGER CURRENT] {} mA".format(current))
+    return current
 
-if __name__ == "__main__":
-    run()
+# ======================================================
+# THUMB CURRENT (INA219)
+# ======================================================
+def get_thumb_current():
+    try:
+        current = round(ina_thumb.current, 1)
+    except:
+        current = 0.0
+    if DEBUG:
+        print("[THUMB CURRENT] {} mA".format(current))
+    return current
+
+# ======================================================
+# FULL FEEDBACK PACK
+# ======================================================
+def get_all_feedback():
+    t = get_temperature()
+    p = get_palm_pressure()
+    bv, bp = get_battery_level()
+
+    return {
+        "temperature": t,
+        "palm_pressure": p,
+        "battery_voltage": bv,
+        "battery_percent": bp
+    }
