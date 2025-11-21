@@ -1,9 +1,10 @@
+#!/usr/bin/env python3
 import time
 import threading
 import pigpio
 import RPi.GPIO as GPIO
 
-import data  # your sensor module
+import data  # sensor module
 
 REAL = True  # running on actual hardware
 
@@ -26,15 +27,13 @@ PIN_LED_B = 13
 
 PIN_BUZZ = 26
 
-# safe max angle
 MAX_ANGLE = 180
 STEP = 3
 STEP_DELAY = 0.015
 
-# Current threshold for grip stop
 GRIP_THRESHOLD = 150  # mA
 
-# pigpio
+# pigpio instance
 pi = pigpio.pi()
 
 # GPIO setup
@@ -46,7 +45,7 @@ GPIO.setup(PIN_LED_G, GPIO.OUT)
 GPIO.setup(PIN_LED_B, GPIO.OUT)
 GPIO.setup(PIN_BUZZ, GPIO.OUT)
 
-# PUSH BUTTON (one side to GPIO27, other to GND)
+# PUSH BUTTON (GPIO27 → GND)
 GPIO.setup(PIN_PUSH, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
 
@@ -88,40 +87,32 @@ def get_avg_current():
     vals = []
     for _ in range(3):
         try:
-            vals.append(data.get_finger_current())  # reads INA219
+            vals.append(data.get_finger_current())
         except:
             vals.append(0)
         time.sleep(0.008)
-
     return sum(vals) / len(vals)
 
 
 # -------------------------
-# CLOSE UNTIL GRIP LOGIC
+# CLOSE UNTIL GRIP
 # -------------------------
 
 def close_until_grip(pin):
-    """
-    Closes a finger servo until:
-      - threshold crossed → stop early
-      - OR fully closed
-    """
     for ang in range(0, MAX_ANGLE + 1, STEP):
         servo_write(pin, ang)
         time.sleep(STEP_DELAY)
 
         curr = get_avg_current()
-
         if curr >= GRIP_THRESHOLD:
             print(f"[GRIP] Stopped early at {ang}°, current={curr}")
             buzz(0.05)
             return True
-
     return False
 
 
 # -------------------------
-# OPEN FULLY
+# OPEN FINGERS
 # -------------------------
 
 def open_finger(pin):
@@ -147,7 +138,7 @@ def all_open():
 
 
 # -------------------------
-# INDIVIDUAL CONTROLS (for Wireless UI)
+# INDIVIDUAL CONTROL (Wireless)
 # -------------------------
 
 def thumb_on(): close_until_grip(PIN_THUMB)
@@ -163,13 +154,12 @@ def all_on(): all_close()
 def all_off(): all_open()
 
 
-
 # -------------------------
 # MODE MANAGEMENT
 # -------------------------
 
-current_mode = "button"    # default
-push_state = False         # false=open, true=closed from button
+current_mode = "button"
+push_state = False
 
 
 def set_mode(m):
@@ -177,14 +167,13 @@ def set_mode(m):
     current_mode = m
 
     if m == "fsr":
-        led(r=True, g=True, b=False)  # yellow
+        led(r=True, g=True, b=False)  # Yellow
     elif m == "button":
-        led(r=False, g=True, b=False)  # green
+        led(r=False, g=True, b=False)  # Green
     elif m == "wire":
-        led(r=False, g=False, b=True)  # blue
+        led(r=False, g=False, b=True)  # Blue
 
     print(f"[MAIN] Mode set to: {m}")
-
 
 
 # -------------------------
@@ -192,13 +181,11 @@ def set_mode(m):
 # -------------------------
 
 def _handle_push(channel):
-    """Physical button press toggles all fingers."""
     global push_state
 
     if current_mode != "button":
         return
 
-    # falling = pressed
     if push_state is False:
         print("[BTN] Close fingers (push)")
         all_close()
@@ -207,10 +194,20 @@ def _handle_push(channel):
         print("[BTN] Open fingers (push)")
         all_open()
         push_state = False
-    
 
-GPIO.add_event_detect(PIN_PUSH, GPIO.FALLING,
-                      callback=_handle_push, bouncetime=250)
+
+# ---- FIX: Remove old edge detect safely ----
+try:
+    GPIO.remove_event_detect(PIN_PUSH)
+except:
+    pass
+
+GPIO.add_event_detect(
+    PIN_PUSH,
+    GPIO.FALLING,
+    callback=_handle_push,
+    bouncetime=250
+)
 
 
 
@@ -219,14 +216,9 @@ GPIO.add_event_detect(PIN_PUSH, GPIO.FALLING,
 # -------------------------
 
 def joint_loop():
-    """Continuous movement for elbow & wrist using potentiometer."""
     while True:
-        if REAL:
-            wrist_percent = data.get_wrist_angle()
-            elbow_percent = data.get_elbow_angle()
-        else:
-            wrist_percent = 50
-            elbow_percent = 50
+        wrist_percent = data.get_wrist_angle()
+        elbow_percent = data.get_elbow_angle()
 
         servo_write(PIN_WRIST, int((wrist_percent / 100) * 180))
         servo_write(PIN_ELBOW, int((elbow_percent / 100) * 180))
@@ -237,17 +229,14 @@ def joint_loop():
 threading.Thread(target=joint_loop, daemon=True).start()
 
 
-
 # -------------------------
 # FSR MODE THREAD
 # -------------------------
 
 def fsr_loop():
-    """FSR-based auto-grip mode."""
     while True:
         if current_mode == "fsr":
-            pressed = data.get_trigger_fsr()
-            if pressed:
+            if data.get_trigger_fsr():
                 all_close()
             else:
                 all_open()
@@ -255,7 +244,6 @@ def fsr_loop():
 
 
 threading.Thread(target=fsr_loop, daemon=True).start()
-
 
 
 # -------------------------
