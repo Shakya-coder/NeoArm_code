@@ -3,7 +3,6 @@ import board
 import busio
 
 from adafruit_ads1x15.ads1115 import ADS1115
-from adafruit_ads1x15.ads1x15 import ADS1x15
 from adafruit_ads1x15.analog_in import AnalogIn
 from adafruit_ina219 import INA219
 
@@ -17,32 +16,32 @@ i2c = busio.I2C(board.SCL, board.SDA)
 # -----------------------------
 # ADS1115 MODULES
 # -----------------------------
-ads1 = ADS1115(i2c, address=0x48)   # feedback sensors
-ads2 = ADS1115(i2c, address=0x49)   # control sensors
+ads1 = ADS1115(i2c, address=0x48)   # feedback sensors: LM35, FSR, Battery
+ads2 = ADS1115(i2c, address=0x49)   # control sensors: FSR trigger + wrist + elbow
 
 # -----------------------------
 # INA219 MODULES
 # -----------------------------
-ina_fingers = INA219(i2c, addr=0x40)   # fingers servo group
-ina_thumb   = INA219(i2c, addr=0x41)   # thumb servo
+ina_fingers = INA219(i2c, addr=0x40)
+ina_thumb   = INA219(i2c, addr=0x41)
 
 
 # ======================================================
-# TEMPERATURE (LM35 → ADS1 A0)
+# TEMPERATURE — ADS1 channel 0
 # ======================================================
 def get_temperature():
-    chan = AnalogIn(ads1, ADS1x15.P0)
-    temp_c = round(chan.voltage * 100.0, 2)   # LM35 = 10mV per °C
+    chan = AnalogIn(ads1, 0)
+    temp_c = round(chan.voltage * 100.0, 2)  # LM35: 10mV per Celsius
     if DEBUG:
         print("[TEMP]", temp_c, "C")
     return temp_c
 
 
 # ======================================================
-# PALM PRESSURE (FSR → ADS1 A1)
+# PALM PRESSURE — ADS1 channel 1
 # ======================================================
 def get_palm_pressure():
-    chan = AnalogIn(ads1, ADS1x15.P1)
+    chan = AnalogIn(ads1, 1)
     raw = chan.value
     percent = round((raw / 32767.0) * 100.0, 1)
 
@@ -53,14 +52,14 @@ def get_palm_pressure():
 
 
 # ======================================================
-# BATTERY STATUS (ADS1 A2)
+# BATTERY — ADS1 channel 2
 # ======================================================
 def get_battery_level():
-    chan = AnalogIn(ads1, ADS1x15.P2)
+    chan = AnalogIn(ads1, 2)
     raw_volt = chan.voltage
 
-    scale_factor = 4.13  # 147k/47k divider
-    batt_voltage = round(raw_volt * scale_factor, 2)
+    SCALE = 4.13  # 147k/47k divider
+    batt_voltage = round(raw_volt * SCALE, 2)
 
     percent = ((batt_voltage - 9.6) / 3.0) * 100
     percent = max(0, min(100, round(percent, 1)))
@@ -72,13 +71,12 @@ def get_battery_level():
 
 
 # ======================================================
-# TRIGGER FSR (ADS2 A0)
+# TRIGGER FSR — ADS2 channel 0
 # ======================================================
 def get_trigger_fsr():
-    chan = AnalogIn(ads2, ADS1x15.P0)
+    chan = AnalogIn(ads2, 0)
     raw = chan.value
-    TRIGGER_THRESHOLD = 12000
-    pressed = raw > TRIGGER_THRESHOLD
+    pressed = raw > 12000
 
     if DEBUG:
         print("[FSR TRIGGER] Raw:", raw, "Pressed:", pressed)
@@ -87,46 +85,44 @@ def get_trigger_fsr():
 
 
 # ======================================================
-# WRIST POT (ADS2 A1)
+# WRIST POT — ADS2 channel 1
 # ======================================================
 def get_wrist_angle():
-    chan = AnalogIn(ads2, ADS1x15.P1)
-    raw = chan.value
-    percent = round((raw / 32767.0) * 100.0, 1)
+    raw = AnalogIn(ads2, 1).value
+    pct = round((raw / 32767.0) * 100.0, 1)
 
     if DEBUG:
-        print("[WRIST POT] Raw:", raw, "Percent:", percent)
+        print("[WRIST POT]", pct, "%")
 
-    return percent
+    return pct
 
 
 # ======================================================
-# ELBOW POT (ADS2 A2)
+# ELBOW POT — ADS2 channel 2
 # ======================================================
 def get_elbow_angle():
-    chan = AnalogIn(ads2, ADS1x15.P2)
-    raw = chan.value
-    percent = round((raw / 32767.0) * 100.0, 1)
+    raw = AnalogIn(ads2, 2).value
+    pct = round((raw / 32767.0) * 100.0, 1)
 
     if DEBUG:
-        print("[ELBOW POT] Raw:", raw, "Percent:", percent)
+        print("[ELBOW POT]", pct, "%")
 
-    return percent
+    return pct
 
 
 # ======================================================
-# FINGER GROUP CURRENT
+# FINGER CURRENT
 # ======================================================
 def get_finger_current():
     try:
-        current = round(ina_fingers.current, 1)
+        c = round(ina_fingers.current, 1)
     except:
-        current = 0.0
+        c = 0.0
 
     if DEBUG:
-        print("[FINGER CURRENT]", current, "mA")
+        print("[FINGER CURRENT]", c, "mA")
 
-    return current
+    return c
 
 
 # ======================================================
@@ -134,37 +130,37 @@ def get_finger_current():
 # ======================================================
 def get_thumb_current():
     try:
-        current = round(ina_thumb.current, 1)
+        c = round(ina_thumb.current, 1)
     except:
-        current = 0.0
+        c = 0.0
 
     if DEBUG:
-        print("[THUMB CURRENT]", current, "mA")
+        print("[THUMB CURRENT]", c, "mA")
 
-    return current
+    return c
 
 
 # ======================================================
-# COMBINED FEEDBACK FOR WEB / OLED
+# FEEDBACK FOR WEB + OLED
 # ======================================================
 def get_all_feedback():
     t = get_temperature()
     p = get_palm_pressure()
-    bv, bp = get_battery_level()
+    v, b = get_battery_level()
 
     return {
         "temperature": t,
         "palm_pressure": p,
-        "battery_voltage": bv,
-        "battery_percent": bp
+        "battery_voltage": v,
+        "battery_percent": b
     }
 
 
 # ======================================================
-# LIVE TEST MODE
+# TEST MODE
 # ======================================================
 if __name__ == "__main__":
-    print("Running sensor test... Press CTRL+C to stop.\n")
+    print("Running sensor test... CTRL+C to stop.\n")
 
     while True:
         try:
