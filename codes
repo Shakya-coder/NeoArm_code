@@ -1,175 +1,109 @@
-
 import time
 import board
 import busio
 
-# ADS1115 imports
-from adafruit_ads1x15.ads1115 import ADS1115
-from adafruit_ads1x15.ads1x15 import ADS1X15 as ADS
+from adafruit_ads1x15.ads1115 import ADS1115, ADS1115 as ADS
 from adafruit_ads1x15.analog_in import AnalogIn
-
-# INA219 import
 from adafruit_ina219 import INA219
 
-# -----------------------------
-# DEBUG MODE
-# -----------------------------
 DEBUG = True
 
-# -----------------------------
 # I2C BUS
-# -----------------------------
 i2c = busio.I2C(board.SCL, board.SDA)
 
-# -----------------------------
-# ADS1115 MODULES
-# -----------------------------
-ads1 = ADS1115(i2c, address=0x48)  # feedback sensors
-ads2 = ADS1115(i2c, address=0x49)  # control sensors
+# ADS1115
+ads1 = ADS1115(i2c, address=0x48)
+ads2 = ADS1115(i2c, address=0x49)
 
-# -----------------------------
-# INA219 MODULES
-# -----------------------------
+# INA219
 ina_fingers = INA219(i2c, addr=0x40)
-ina_thumb = INA219(i2c, addr=0x41)
+ina_thumb   = INA219(i2c, addr=0x41)
 
-# ======================================================
-# TEMPERATURE LM35 (ADS1 A0)
-# ======================================================
+# ===== TEMP (LM35 A0) =====
 def get_temperature():
     chan = AnalogIn(ads1, ADS.P0)
-    voltage = chan.voltage
-    temp_c = round(voltage * 100.0, 2)
-    if DEBUG:
-        print("[TEMP] {} C".format(temp_c))
-    return temp_c
+    temp = round(chan.voltage * 100.0, 2)
+    if DEBUG: print("[TEMP]", temp, "C")
+    return temp
 
-# ======================================================
-# PALM PRESSURE FSR (ADS1 A1)
-# ======================================================
+# ===== PALM PRESSURE (FSR A1) =====
 def get_palm_pressure():
     chan = AnalogIn(ads1, ADS.P1)
     raw = chan.value
-    percent = round((raw / 32767.0) * 100.0, 1)
-    if DEBUG:
-        print("[PALM PRESSURE] Raw={}  Percent={}%".format(raw, percent))
-    return percent
+    pct = round((raw / 32767.0) * 100.0, 1)
+    if DEBUG: print("[PALM PRESSURE] Raw", raw, "=", pct, "%")
+    return pct
 
-# ======================================================
-# BATTERY STATUS 3S LiPo (ADS1 A2)
-# ======================================================
+# ===== BATTERY (A2) =====
 def get_battery_level():
     chan = AnalogIn(ads1, ADS.P2)
-    raw_volt = chan.voltage
+    v = chan.voltage * 4.13
+    v = round(v, 2)
+    pct = max(0, min(100, round((v - 9.6) / 3.0 * 100.0, 1)))
+    if DEBUG: print("[BATTERY]", v, "V", pct, "%")
+    return v, pct
 
-    batt_voltage = round(raw_volt * 4.13, 2)  # divider 147k/47k
-    percent = (batt_voltage - 9.6) / 3.0 * 100.0
-    percent = max(0, min(100, round(percent, 1)))
-
-    if DEBUG:
-        print("[BATTERY] {} V  {} %".format(batt_voltage, percent))
-    return batt_voltage, percent
-
-# ======================================================
-# TRIGGER FSR (ADS2 A0)
-# ======================================================
+# ===== FSR TRIGGER (ADS2 A0) =====
 def get_trigger_fsr():
-    chan = AnalogIn(ads2, ADS.P0)
-    raw = chan.value
+    raw = AnalogIn(ads2, ADS.P0).value
     pressed = raw > 12000
-    if DEBUG:
-        print("[FSR TRIGGER] Raw={} Pressed={}".format(raw, pressed))
+    if DEBUG: print("[FSR TRIGGER] Raw", raw, "Pressed", pressed)
     return pressed
 
-# ======================================================
-# WRIST POTENTIOMETER (ADS2 A1)
-# ======================================================
+# ===== WRIST POT (A1) =====
 def get_wrist_angle():
-    chan = AnalogIn(ads2, ADS.P1)
-    raw = chan.value
-    percent = round((raw / 32767.0) * 100.0, 1)
-    if DEBUG:
-        print("[WRIST POT] Raw={} Percent={}%".format(raw, percent))
-    return percent
+    raw = AnalogIn(ads2, ADS.P1).value
+    pct = round((raw / 32767.0) * 100.0, 1)
+    if DEBUG: print("[WRIST]", pct, "%")
+    return pct
 
-# ======================================================
-# ELBOW POTENTIOMETER (ADS2 A2)
-# ======================================================
+# ===== ELBOW POT (A2) =====
 def get_elbow_angle():
-    chan = AnalogIn(ads2, ADS.P2)
-    raw = chan.value
-    percent = round((raw / 32767.0) * 100.0, 1)
-    if DEBUG:
-        print("[ELBOW POT] Raw={} Percent={}%".format(raw, percent))
-    return percent
+    raw = AnalogIn(ads2, ADS.P2).value
+    pct = round((raw / 32767.0) * 100.0, 1)
+    if DEBUG: print("[ELBOW]", pct, "%")
+    return pct
 
-# ======================================================
-# FINGER CURRENT VIA INA219 #1
-# ======================================================
+# ===== CURRENT READINGS =====
 def get_finger_current():
-    try:
-        current = round(ina_fingers.current, 1)
-    except:
-        current = 0.0
-    if DEBUG:
-        print("[FINGER CURRENT] {} mA".format(current))
-    return current
+    try: c = round(ina_fingers.current, 1)
+    except: c = 0.0
+    if DEBUG: print("[FINGER CURRENT]", c, "mA")
+    return c
 
-# ======================================================
-# THUMB CURRENT VIA INA219 #2
-# ======================================================
 def get_thumb_current():
-    try:
-        current = round(ina_thumb.current, 1)
-    except:
-        current = 0.0
-    if DEBUG:
-        print("[THUMB CURRENT] {} mA".format(current))
-    return current
+    try: c = round(ina_thumb.current, 1)
+    except: c = 0.0
+    if DEBUG: print("[THUMB CURRENT]", c, "mA")
+    return c
 
-# ======================================================
-# COMBINED FEEDBACK DICT
-# ======================================================
+# ===== COMBINED FEEDBACK =====
 def get_all_feedback():
     t = get_temperature()
     p = get_palm_pressure()
-    bv, bp = get_battery_level()
-
+    v, b = get_battery_level()
     return {
         "temperature": t,
         "palm_pressure": p,
-        "battery_voltage": bv,
-        "battery_percent": bp
+        "battery_voltage": v,
+        "battery_percent": b
     }
 
-# ======================================================
-# TEST LOOP (RUN WHEN EXECUTED DIRECTLY)
-# ======================================================
+# ===== TEST MODE =====
 if __name__ == "__main__":
-    print("Running sensor test... press CTRL+C to stop.\n")
+    print("Running sensor test... CTRL+C to stop.\n")
     while True:
         try:
-            t = get_temperature()
-            p = get_palm_pressure()
-            bv, bp = get_battery_level()
-            fsr = get_trigger_fsr()
-            w = get_wrist_angle()
-            e = get_elbow_angle()
-            fc = get_finger_current()
-            tc = get_thumb_current()
-
-            print("\n----- SENSOR READINGS -----")
-            print("Temperature:", t, "C")
-            print("Palm Pressure:", p, "%")
-            print("Battery:", bv, "V  |", bp, "%")
-            print("FSR Trigger:", fsr)
-            print("Wrist Angle:", w, "%")
-            print("Elbow Angle:", e, "%")
-            print("Finger Current:", fc, "mA")
-            print("Thumb Current:", tc, "mA")
-
+            print("\n==== FEEDBACK ====")
+            print("Temp:", get_temperature(), "C")
+            print("Pressure:", get_palm_pressure(), "%")
+            print("Battery:", get_battery_level())
+            print("FSR:", get_trigger_fsr())
+            print("Wrist:", get_wrist_angle())
+            print("Elbow:", get_elbow_angle())
+            print("Finger Current:", get_finger_current(), "mA")
+            print("Thumb Current:", get_thumb_current(), "mA")
             time.sleep(1)
-
         except KeyboardInterrupt:
-            print("\nStopped.")
+            print("Stopped.")
             break
