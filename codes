@@ -1,16 +1,24 @@
+#!/usr/bin/env python3
 import time
 import threading
 import subprocess
-
 import pigpio
 import RPi.GPIO as GPIO
-import data
 
-REAL = True  # running on actual hardware
+import data  # sensor module
 
-# -------------------------
-# GPIO / SERVO DEFINITIONS
-# -------------------------
+import board
+import busio
+from adafruit_ssd1306 import SSD1306_I2C
+from PIL import Image, ImageDraw, ImageFont
+
+
+REAL = True
+
+
+# ============================================================
+# GPIO DEFINITIONS
+# ============================================================
 
 PIN_THUMB = 22
 PIN_IM = 18
@@ -19,7 +27,7 @@ PIN_RP = 17
 PIN_WRIST = 23
 PIN_ELBOW = 24
 
-PIN_PUSH = 27  # physical pushbutton input
+PIN_PUSH = 27        # push button → GND
 
 PIN_LED_R = 5
 PIN_LED_G = 6
@@ -31,12 +39,12 @@ MAX_ANGLE = 180
 STEP = 3
 STEP_DELAY = 0.015
 
-GRIP_THRESHOLD = 150  # mA
+GRIP_THRESHOLD = 150   # mA current stop
 
 
-# =====================================================
-# GPIO SETUP (must come BEFORE pigpio)
-# =====================================================
+# ============================================================
+# GPIO INIT (MUST BE FIRST)
+# ============================================================
 
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
@@ -48,16 +56,59 @@ GPIO.setup(PIN_BUZZ, GPIO.OUT)
 
 GPIO.setup(PIN_PUSH, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
-# remove stale event detectors
 try:
     GPIO.remove_event_detect(PIN_PUSH)
 except:
     pass
 
 
-# =====================================================
-# LED / BUZZER HELPERS
-# =====================================================
+# ============================================================
+# OLED INIT
+# ============================================================
+
+i2c = busio.I2C(board.SCL, board.SDA)
+oled = SSD1306_I2C(128, 64, i2c)
+
+oled.fill(0)
+oled.show()
+
+font = ImageFont.load_default()
+
+
+def update_oled():
+    """OLED feedback display"""
+    try:
+        temp = data.get_temperature()
+        pressure = data.get_palm_pressure()
+        bv, bp = data.get_battery_level()
+    except:
+        temp, pressure, bv, bp = 0, 0, 0, 0
+
+    img = Image.new("1", (128, 64))
+    draw = ImageDraw.Draw(img)
+
+    draw.text((0, 0), "NeoArm Status", font=font, fill=255)
+    draw.text((0, 16), f"Temp: {temp:.1f} C", font=font, fill=255)
+    draw.text((0, 28), f"Palm: {pressure:.1f}%", font=font, fill=255)
+    draw.text((0, 40), f"Batt: {bp:.0f}% ({bv:.2f}V)", font=font, fill=255)
+
+    oled.image(img)
+    oled.show()
+
+
+# OLED Thread
+def oled_loop():
+    while True:
+        update_oled()
+        time.sleep(0.5)
+
+
+threading.Thread(target=oled_loop, daemon=True).start()
+
+
+# ============================================================
+# LED + BUZZER
+# ============================================================
 
 def led(r=False, g=False, b=False):
     GPIO.output(PIN_LED_R, GPIO.HIGH if r else GPIO.LOW)
@@ -65,76 +116,20 @@ def led(r=False, g=False, b=False):
     GPIO.output(PIN_LED_B, GPIO.HIGH if b else GPIO.LOW)
 
 
-def buzz(duration=0.1):
+def buzz(duration=0.08):
     GPIO.output(PIN_BUZZ, True)
     time.sleep(duration)
     GPIO.output(PIN_BUZZ, False)
 
 
-# =====================================================
-# MODE MANAGEMENT
-# =====================================================
-
-current_mode = "button"
-push_state = False
-
-def set_mode(m):
-    global current_mode
-    current_mode = m
-
-    if m == "fsr":
-        led(True, True, False)       # yellow
-    elif m == "button":
-        led(False, True, False)      # green
-    elif m == "wire":
-        led(False, False, True)      # blue
-
-    print("[MAIN] Mode set:", m)
-
-
-# =====================================================
-# PUSH BUTTON HANDLER
-# =====================================================
-
-def _handle_push(channel):
-    global push_state
-
-    if current_mode != "button":
-        return
-
-    if not push_state:
-        print("[BTN] Close fingers (push)")
-        all_close()
-        push_state = True
-    else:
-        print("[BTN] Open fingers (push)")
-        all_open()
-        push_state = False
-
-
-# register event BEFORE pigpio
-try:
-    GPIO.add_event_detect(PIN_PUSH, GPIO.FALLING,
-                          callback=_handle_push, bouncetime=250)
-    print("[MAIN] Push button interrupt enabled.")
-except Exception as e:
-    print("[ERR] Cannot enable event detect:", e)
-
-
-# =====================================================
-# START pigpio AFTER event detect is set
-# =====================================================
+# ============================================================
+# pigpio servo control
+# ============================================================
 
 pi = pigpio.pi()
 if not pi.connected:
-    print("[ERR] pigpio not running!")
-else:
-    print("[MAIN] pigpio connected.")
+    print("[ERR] pigpio failed to start")
 
-
-# =====================================================
-# SERVO HELPERS
-# =====================================================
 
 def servo_write(pin, angle):
     pulse = 500 + (angle / 180.0) * 2000
@@ -145,9 +140,9 @@ def servo_off(pin):
     pi.set_servo_pulsewidth(pin, 0)
 
 
-# =====================================================
-# CURRENT SMOOTHING
-# =====================================================
+# ============================================================
+# CURRENT AVERAGING
+# ============================================================
 
 def get_avg_current():
     vals = []
@@ -160,11 +155,12 @@ def get_avg_current():
     return sum(vals) / len(vals)
 
 
-# =====================================================
-# SERVO LOGIC (Grip stop)
-# =====================================================
+# ============================================================
+# SERVO LOGIC
+# ============================================================
 
 def close_until_grip(pin):
+    """Stop early when object detected via current spike"""
     for ang in range(0, MAX_ANGLE + 1, STEP):
         servo_write(pin, ang)
         time.sleep(STEP_DELAY)
@@ -172,8 +168,8 @@ def close_until_grip(pin):
         curr = get_avg_current()
 
         if curr >= GRIP_THRESHOLD:
-            print(f"[GRIP] Stop at {ang} deg | current={curr}")
-            buzz(0.05)
+            print(f"[GRIP] Stop at {ang}°, current={curr}")
+            buzz()
             return True
 
     return False
@@ -185,9 +181,9 @@ def open_finger(pin):
         time.sleep(STEP_DELAY)
 
 
-# =====================================================
+# ============================================================
 # GROUP CONTROL
-# =====================================================
+# ============================================================
 
 def all_close():
     close_until_grip(PIN_THUMB)
@@ -201,10 +197,7 @@ def all_open():
     open_finger(PIN_RP)
 
 
-# =====================================================
-# INDIVIDUAL (Wireless UI)
-# =====================================================
-
+# Wireless functions (webserver uses these)
 def thumb_on(): close_until_grip(PIN_THUMB)
 def thumb_off(): open_finger(PIN_THUMB)
 
@@ -218,17 +211,68 @@ def all_on(): all_close()
 def all_off(): all_open()
 
 
-# =====================================================
+# ============================================================
+# MODE MANAGEMENT
+# ============================================================
+
+current_mode = "button"
+push_state = False
+
+
+def set_mode(m):
+    global current_mode
+    current_mode = m
+
+    if m == "fsr":
+        led(True, True, False)
+    elif m == "button":
+        led(False, True, False)
+    elif m == "wire":
+        led(False, False, True)
+
+    print("[MAIN] Mode set:", m)
+
+
+# ============================================================
+# PUSH BUTTON HANDLER
+# ============================================================
+
+def _handle_push(channel):
+    global push_state
+
+    if current_mode != "button":
+        return
+
+    if not push_state:
+        print("[BTN] Close fingers")
+        all_close()
+        push_state = True
+    else:
+        print("[BTN] Open fingers")
+        all_open()
+        push_state = False
+
+
+# Safe event detect
+try:
+    GPIO.add_event_detect(PIN_PUSH, GPIO.FALLING,
+                          callback=_handle_push, bouncetime=250)
+    print("[MAIN] Push button interrupt OK")
+except Exception as e:
+    print("[ERR] Failed to add event detect:", e)
+
+
+# ============================================================
 # WRIST + ELBOW THREAD
-# =====================================================
+# ============================================================
 
 def joint_loop():
     while True:
-        wrist = data.get_wrist_angle()
-        elbow = data.get_elbow_angle()
+        wp = data.get_wrist_angle()
+        ep = data.get_elbow_angle()
 
-        servo_write(PIN_WRIST, int((wrist / 100) * 180))
-        servo_write(PIN_ELBOW, int((elbow / 100) * 180))
+        servo_write(PIN_WRIST, int((wp / 100) * 180))
+        servo_write(PIN_ELBOW, int((ep / 100) * 180))
 
         time.sleep(0.05)
 
@@ -236,9 +280,9 @@ def joint_loop():
 threading.Thread(target=joint_loop, daemon=True).start()
 
 
-# =====================================================
+# ============================================================
 # FSR MODE THREAD
-# =====================================================
+# ============================================================
 
 def fsr_loop():
     while True:
@@ -253,14 +297,15 @@ def fsr_loop():
 threading.Thread(target=fsr_loop, daemon=True).start()
 
 
-# =====================================================
-# MAIN ENTRY
-# =====================================================
+# ============================================================
+# MAIN LOOP
+# ============================================================
 
 if __name__ == "__main__":
     print("[MAIN] NeoArm control running...")
     set_mode(current_mode)
 
+    # Launch webserver
     print("[MAIN] Starting webserver...")
     subprocess.Popen(["python3", "/home/rohit/NeoArm/webserver.py"])
 
