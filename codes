@@ -1,9 +1,10 @@
 import time
 import threading
+import subprocess
+
 import pigpio
 import RPi.GPIO as GPIO
-
-import data  # sensor module
+import data
 
 REAL = True  # running on actual hardware
 
@@ -26,17 +27,15 @@ PIN_LED_B = 13
 
 PIN_BUZZ = 26
 
-# safe max angle
 MAX_ANGLE = 180
 STEP = 3
 STEP_DELAY = 0.015
 
-# Current threshold for grip stop
 GRIP_THRESHOLD = 150  # mA
 
 
 # =====================================================
-# FIRST: SETUP RPi.GPIO BEFORE pigpio STARTS
+# GPIO SETUP (must come BEFORE pigpio)
 # =====================================================
 
 GPIO.setmode(GPIO.BCM)
@@ -47,10 +46,9 @@ GPIO.setup(PIN_LED_G, GPIO.OUT)
 GPIO.setup(PIN_LED_B, GPIO.OUT)
 GPIO.setup(PIN_BUZZ, GPIO.OUT)
 
-# push button → GPIO27 → GND
 GPIO.setup(PIN_PUSH, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
-# Remove any old stale detects
+# remove stale event detectors
 try:
     GPIO.remove_event_detect(PIN_PUSH)
 except:
@@ -58,7 +56,7 @@ except:
 
 
 # =====================================================
-# LED & BUZZER HELPERS
+# LED / BUZZER HELPERS
 # =====================================================
 
 def led(r=False, g=False, b=False):
@@ -74,10 +72,64 @@ def buzz(duration=0.1):
 
 
 # =====================================================
-# START pigpio AFTER button interrupt is registered
+# MODE MANAGEMENT
 # =====================================================
 
-pi = pigpio.pi()   # <-- FIXED: pigpio starts AFTER RPi.GPIO interrupt setup
+current_mode = "button"
+push_state = False
+
+def set_mode(m):
+    global current_mode
+    current_mode = m
+
+    if m == "fsr":
+        led(True, True, False)       # yellow
+    elif m == "button":
+        led(False, True, False)      # green
+    elif m == "wire":
+        led(False, False, True)      # blue
+
+    print("[MAIN] Mode set:", m)
+
+
+# =====================================================
+# PUSH BUTTON HANDLER
+# =====================================================
+
+def _handle_push(channel):
+    global push_state
+
+    if current_mode != "button":
+        return
+
+    if not push_state:
+        print("[BTN] Close fingers (push)")
+        all_close()
+        push_state = True
+    else:
+        print("[BTN] Open fingers (push)")
+        all_open()
+        push_state = False
+
+
+# register event BEFORE pigpio
+try:
+    GPIO.add_event_detect(PIN_PUSH, GPIO.FALLING,
+                          callback=_handle_push, bouncetime=250)
+    print("[MAIN] Push button interrupt enabled.")
+except Exception as e:
+    print("[ERR] Cannot enable event detect:", e)
+
+
+# =====================================================
+# START pigpio AFTER event detect is set
+# =====================================================
+
+pi = pigpio.pi()
+if not pi.connected:
+    print("[ERR] pigpio not running!")
+else:
+    print("[MAIN] pigpio connected.")
 
 
 # =====================================================
@@ -94,7 +146,7 @@ def servo_off(pin):
 
 
 # =====================================================
-# AVERAGE CURRENT
+# CURRENT SMOOTHING
 # =====================================================
 
 def get_avg_current():
@@ -109,7 +161,7 @@ def get_avg_current():
 
 
 # =====================================================
-# CLOSE UNTIL GRIP
+# SERVO LOGIC (Grip stop)
 # =====================================================
 
 def close_until_grip(pin):
@@ -120,16 +172,12 @@ def close_until_grip(pin):
         curr = get_avg_current()
 
         if curr >= GRIP_THRESHOLD:
-            print(f"[GRIP] Stop at {ang}°  current={curr}")
+            print(f"[GRIP] Stop at {ang} deg | current={curr}")
             buzz(0.05)
             return True
 
     return False
 
-
-# =====================================================
-# OPEN FULLY
-# =====================================================
 
 def open_finger(pin):
     for ang in range(MAX_ANGLE, -1, -STEP):
@@ -138,7 +186,7 @@ def open_finger(pin):
 
 
 # =====================================================
-# GROUP CONTROLS
+# GROUP CONTROL
 # =====================================================
 
 def all_close():
@@ -154,7 +202,7 @@ def all_open():
 
 
 # =====================================================
-# WIRELESS CONTROL FUNCTIONS
+# INDIVIDUAL (Wireless UI)
 # =====================================================
 
 def thumb_on(): close_until_grip(PIN_THUMB)
@@ -171,67 +219,16 @@ def all_off(): all_open()
 
 
 # =====================================================
-# MODE MANAGEMENT
-# =====================================================
-
-current_mode = "button"
-push_state = False
-
-
-def set_mode(m):
-    global current_mode
-    current_mode = m
-
-    if m == "fsr":
-        led(True, True, False)
-    elif m == "button":
-        led(False, True, False)
-    elif m == "wire":
-        led(False, False, True)
-
-    print(f"[MAIN] Mode set:", m)
-
-
-# =====================================================
-# PUSH BUTTON INTERRUPT HANDLER
-# =====================================================
-
-def _handle_push(channel):
-    global push_state
-
-    if current_mode != "button":
-        return
-
-    if not push_state:
-        print("[BTN] Close (push)")
-        all_close()
-        push_state = True
-    else:
-        print("[BTN] Open (push)")
-        all_open()
-        push_state = False
-
-
-# REGISTER INTERRUPT SAFELY
-try:
-    GPIO.add_event_detect(PIN_PUSH, GPIO.FALLING,
-                          callback=_handle_push, bouncetime=250)
-    print("[MAIN] Push button interrupt enabled.")
-except Exception as e:
-    print("[ERR] Cannot enable event detect:", e)
-
-
-# =====================================================
-# JOINT THREAD (WRIST + ELBOW)
+# WRIST + ELBOW THREAD
 # =====================================================
 
 def joint_loop():
     while True:
-        wrist_percent = data.get_wrist_angle()
-        elbow_percent = data.get_elbow_angle()
+        wrist = data.get_wrist_angle()
+        elbow = data.get_elbow_angle()
 
-        servo_write(PIN_WRIST, int((wrist_percent / 100) * 180))
-        servo_write(PIN_ELBOW, int((elbow_percent / 100) * 180))
+        servo_write(PIN_WRIST, int((wrist / 100) * 180))
+        servo_write(PIN_ELBOW, int((elbow / 100) * 180))
 
         time.sleep(0.05)
 
@@ -240,7 +237,7 @@ threading.Thread(target=joint_loop, daemon=True).start()
 
 
 # =====================================================
-# FSR THREAD
+# FSR MODE THREAD
 # =====================================================
 
 def fsr_loop():
@@ -257,12 +254,15 @@ threading.Thread(target=fsr_loop, daemon=True).start()
 
 
 # =====================================================
-# MAIN LOOP
+# MAIN ENTRY
 # =====================================================
 
 if __name__ == "__main__":
     print("[MAIN] NeoArm control running...")
     set_mode(current_mode)
+
+    print("[MAIN] Starting webserver...")
+    subprocess.Popen(["python3", "/home/rohit/NeoArm/webserver.py"])
 
     try:
         while True:
