@@ -1,112 +1,209 @@
 #!/usr/bin/env python3
 """
-hardware.py  -- servo + grip logic (uses pigpio instance attached by main.py)
-Do NOT create a pigpio instance here. main.py will call attach_pigpio(pi).
+webserver.py  -- small HTTP server with UI.
+This file DOES NOT create pigpio; it imports hardware (which uses pigpio instance
+attached by main.py). main.py starts this server in a thread via webserver.run().
 """
 
+import json
 import time
-import data  # uses INA219 + ADS1115
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import unquote
+import threading
 
-# pins for fingers (BCM)
-PIN_THUMB = 22
-PIN_IM = 18
-PIN_RP = 17
+# attempt to import hardware + data; if missing, run simulation mode
+try:
+    import hardware
+    import data
+    REAL = True
+    print("[WEB] hardware + data modules imported (REAL mode).")
+except Exception as e:
+    REAL = False
+    print("[WEB] Running webserver in SIM MODE:", e)
 
-MAX_ANGLE = 180
-STEP = 3
-STEP_DELAY = 0.012  # faster sweep
-GRIP_THRESHOLD = 150  # mA threshold (tweak as needed)
+# internal state
+current_mode = "button"
+button_states = {"thumb": False, "im": False, "rp": False, "all": False}
 
-# pigpio instance will be attached by main.py
-pi = None
+def set_all(state: bool):
+    button_states["all"] = state
+    button_states["thumb"] = state
+    button_states["im"] = state
+    button_states["rp"] = state
 
-def attach_pigpio(pi_instance):
-    """Attach the pigpio instance created by main.py"""
-    global pi
-    pi = pi_instance
-    if pi is None:
-        print("[HARDWARE] pigpio not attached (pi is None)")
-    else:
-        print("[HARDWARE] pigpio attached")
+def simulated_feedback():
+    t = int(time.time()) % 60
+    return {"pressure": (t % 10) * 10, "temperature": 25 + (t % 5), "battery_percent": 80, "battery_voltage": 11.6}
 
-def set_mode(m):
-    """Optional hook - webserver/main call this to log mode in hardware"""
-    print(f"[HARDWARE] Mode set to: {m}")
+# HTML page (simple)
+HTML = """<!doctype html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NeoArm Control Panel</title>
+<style>
+body{font-family:Arial;background:#f2f3f7;margin:0;padding:12px}
+.container{max-width:800px;margin:auto}
+.card{background:#fff;padding:12px;border-radius:8px;margin-bottom:10px;box-shadow:0 4px 10px rgba(0,0,0,0.06)}
+.mode-btn{margin-right:8px;padding:8px 12px;border-radius:6px;border:1px solid #888;cursor:pointer}
+.mode-btn.active{background:#2ecc71;color:white}
+.btn{padding:8px 12px;border-radius:6px;border:1px solid #666;cursor:pointer;margin-right:6px}
+.btn.on{background:#2ecc71;color:white}
+</style>
+</head>
+<body>
+<div class="container">
+<h2>NeoArm Webinterface</h2>
 
-def _write_servo_pulse(pin, angle):
-    """Write servo pulse if pi attached"""
-    if pi is None:
-        print(f"[HARDWARE] Warning: pigpio not attached. Cannot move servo {pin}")
-        return
-    pulse = 500 + (angle / 180.0) * 2000
-    pi.set_servo_pulsewidth(pin, int(pulse))
+<div class="card">
+<strong>Mode</strong><br>
+<button id="m_fsr" class="mode-btn" onclick="setMode('fsr')">EMG</button>
+<button id="m_button" class="mode-btn" onclick="setMode('button')">Push Button</button>
+<button id="m_wire" class="mode-btn" onclick="setMode('wire')">Wireless</button>
+</div>
 
-def servo_off(pin):
-    if pi is not None:
-        pi.set_servo_pulsewidth(pin, 0)
+<div class="card">
+<strong>Fingers</strong><br>
+<button id="btn_thumb" class="btn" onclick="toggle('thumb')">Thumb</button>
+<button id="btn_im" class="btn" onclick="toggle('im')">Index+Middle</button>
+<button id="btn_rp" class="btn" onclick="toggle('rp')">Ring+Pinky</button>
+<button id="btn_all" class="btn" onclick="toggle('all')">All</button>
+</div>
 
-def get_avg_current():
-    vals = []
-    for _ in range(3):
-        try:
-            vals.append(data.get_finger_current())
-        except Exception:
-            vals.append(0)
-        time.sleep(0.006)
-    return sum(vals) / len(vals)
+<div class="card">
+<strong>Feedback</strong>
+<p>Pressure: <span id="fb_p">--</span>%</p>
+<p>Temp: <span id="fb_t">--</span> C</p>
+<p>Battery: <span id="fb_bp">--</span>% (<span id="fb_bv">--</span>V)</p>
+</div>
+</div>
 
-def close_until_grip(pin):
-    """Close a single finger until current spike (returns True if stopped early)"""
-    print(f"[GRIP] Closing servo {pin}")
-    for ang in range(0, MAX_ANGLE + 1, STEP):
-        _write_servo_pulse(pin, ang)
-        time.sleep(STEP_DELAY)
-        curr = get_avg_current()
-        print(f"[GRIP] pin={pin} angle={ang} current={curr}")
-        if curr >= GRIP_THRESHOLD:
-            print(f"[GRIP] pin={pin} STOP at angle={ang} (current {curr} mA)")
-            return True
-    print(f"[GRIP] pin={pin} fully closed")
-    return False
+<script>
+function api_json(path){
+  return fetch(path, {cache:"no-store"}).then(r=>r.json());
+}
+function setMode(m){ fetch('/mode/'+m); }
+function toggle(name){ fetch('/toggle/'+name).then(r=>r.json()).then(data=>{ updateButtons(data); }); }
 
-def open_finger(pin):
-    print(f"[OPEN] Opening servo {pin}")
-    for ang in range(MAX_ANGLE, -1, -STEP):
-        _write_servo_pulse(pin, ang)
-        time.sleep(STEP_DELAY)
-    # leave servo powered at 0 angle (optionally turn off)
-    # servo_off(pin)
+function updateButtons(state){
+  ['thumb','im','rp','all'].forEach(k=>{
+    let el=document.getElementById('btn_'+k);
+    if(state[k]) el.classList.add('on'); else el.classList.remove('on');
+  });
+}
 
-# group operations
-def all_close():
-    close_until_grip(PIN_THUMB)
-    close_until_grip(PIN_IM)
-    close_until_grip(PIN_RP)
+setInterval(()=>{
+  api_json('/status').then(d=>{
+    let fb = d.feedback;
+    document.getElementById('fb_p').innerText = fb.palm_pressure || fb.pressure || '--';
+    document.getElementById('fb_t').innerText = fb.temperature || '--';
+    document.getElementById('fb_bp').innerText = fb.battery_percent || '--';
+    document.getElementById('fb_bv').innerText = fb.battery_voltage || '--';
+    // mode highlight
+    document.getElementById('m_fsr').classList.toggle('active', d.mode==='fsr');
+    document.getElementById('m_button').classList.toggle('active', d.mode==='button');
+    document.getElementById('m_wire').classList.toggle('active', d.mode==='wire');
+    // buttons
+    updateButtons(d.buttons);
+  }).catch(()=>{});
+}, 900);
 
-def all_open():
-    open_finger(PIN_THUMB)
-    open_finger(PIN_IM)
-    open_finger(PIN_RP)
+</script>
+</body>
+</html>
+"""
 
-# individual controls for webserver UI calls
-def thumb_on(): close_until_grip(PIN_THUMB)
-def thumb_off(): open_finger(PIN_THUMB)
+# HTTP Handler
+class Handler(BaseHTTPRequestHandler):
+    def _send_json(self, code, obj):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(json.dumps(obj).encode('utf-8'))
 
-def im_on(): close_until_grip(PIN_IM)
-def im_off(): open_finger(PIN_IM)
+    def _send_html(self, text):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(text.encode('utf-8'))
 
-def rp_on(): close_until_grip(PIN_RP)
-def rp_off(): open_finger(PIN_RP)
+    def do_GET(self):
+        global current_mode, button_states
+        path = unquote(self.path)
 
-def all_on(): all_close()
-def all_off(): all_open()
+        if path == "/" or path.startswith("/index"):
+            return self._send_html(HTML)
 
-def shutdown():
-    """Turn off servos cleanly"""
-    print("[HARDWARE] shutdown: turning off servos")
+        if path.startswith("/mode/"):
+            m = path.split("/mode/")[1]
+            current_mode = m
+            print(f"[WEB] mode -> {m}")
+            # inform hardware (same process)
+            try:
+                if REAL:
+                    hardware.set_mode(m)
+            except Exception as e:
+                print("[WEB] hardware.set_mode error:", e)
+            return self._send_json(200, {"mode": m})
+
+        if path.startswith("/toggle/"):
+            name = path.split("/toggle/")[1]
+            if name not in button_states:
+                return self._send_json(400, {"error": "Invalid name"})
+            new_state = not button_states[name]
+            button_states[name] = new_state
+            # sync 'all'
+            if name == "all":
+                set_all(new_state)
+            else:
+                # if any individual toggled off -> all = False
+                if not new_state:
+                    button_states["all"] = False
+                else:
+                    if button_states["thumb"] and button_states["im"] and button_states["rp"]:
+                        button_states["all"] = True
+
+            print(f"[WEB] toggle {name} -> {new_state}")
+
+            if REAL:
+                try:
+                    if name == "all":
+                        hardware.all_close() if new_state else hardware.all_open()
+                    else:
+                        func = getattr(hardware, f"{name}_{'on' if new_state else 'off'}", None)
+                        if func:
+                            func()
+                except Exception as e:
+                    print("[WEB] hardware function error:", e)
+
+            return self._send_json(200, button_states.copy())
+
+        if path == "/status":
+            try:
+                if REAL:
+                    fb = data.get_all_feedback()
+                else:
+                    fb = simulated_feedback()
+            except Exception as e:
+                print("[WEB] feedback error:", e)
+                fb = simulated_feedback()
+            return self._send_json(200, {"mode": current_mode, "buttons": button_states, "feedback": fb})
+
+        # unknown
+        self.send_error(404, "Not found")
+
+# server runner
+def run(host="0.0.0.0", port=8080):
+    addr = (host, port)
+    server = HTTPServer(addr, Handler)
+    print(f"[WEB] NeoArm webserver running on http://{host}:{port}")
     try:
-        servo_off(PIN_THUMB)
-        servo_off(PIN_IM)
-        servo_off(PIN_RP)
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("[WEB] Webserver stopping.")
     except Exception as e:
-        print("[HARDWARE] shutdown error:", e)
+        print("[WEB] Server exception:", e)
+    finally:
+        try:
+            server.server_close()
+        except:
+            pass
