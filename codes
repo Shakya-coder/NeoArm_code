@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
+# main.py - simplified NeoArm controller (pigpio button + INA current grip)
+# - Uses pigpio for servo PWM and push-button callback (no RPi.GPIO event_detect)
+# - Relies on data.py for sensor reads (INA219 and ADS1115)
+# - Prints detailed debug logs to terminal
+
 import time
 import threading
-import pigpio
 import subprocess
-import RPi.GPIO as GPIO
+import pigpio
 
-import data      # sensor functions (ADS1115 + INA219)
+import data   # your existing data.py (must provide get_finger_current, get_thumb_current, get_wrist_angle, get_elbow_angle, get_trigger_fsr, get_all_feedback)
 
-REAL = True
-
-# ===========================================================
-# GPIO / SERVO PINS
-# ===========================================================
+# ----------------------------
+# Pins
+# ----------------------------
 PIN_THUMB = 22
 PIN_IM    = 18
 PIN_RP    = 17
@@ -19,221 +21,299 @@ PIN_RP    = 17
 PIN_WRIST = 23
 PIN_ELBOW = 24
 
-PIN_PUSH  = 27     # push button
+PIN_PUSH  = 27   # push button -> GND
 
-# ===========================================================
-# SERVO CONTROL PARAMETERS
-# ===========================================================
+# ----------------------------
+# Servo & timing config
+# ----------------------------
 MAX_ANGLE = 180
-STEP = 6             # servo speed (increase for faster)
-STEP_DELAY = 0.008   # small delay
+STEP = 6                # increase for faster motion (bigger jump per step)
+STEP_DELAY = 0.008      # decrease for faster motion (seconds between steps)
 
-GRIP_THRESHOLD_FINGER = 150   # mA (INA219 @ 0x40)
-GRIP_THRESHOLD_THUMB  = 150   # mA (INA219 @ 0x41)
+# Current thresholds (mA)
+GRIP_THRESHOLD_FINGER = 150.0
+GRIP_THRESHOLD_THUMB  = 150.0
 
-# ===========================================================
-# GPIO SETUP (NO LED, NO BUZZER)
-# ===========================================================
-GPIO.setmode(GPIO.BCM)
-GPIO.setwarnings(False)
+# Debounce for push button (seconds)
+PUSH_DEBOUNCE_SEC = 0.30
 
-GPIO.setup(PIN_PUSH, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-try:
-    GPIO.remove_event_detect(PIN_PUSH)
-except:
-    pass
-
-# ===========================================================
-# CONNECT pigpio
-# ===========================================================
+# ----------------------------
+# Globals / state
+# ----------------------------
 pi = pigpio.pi()
 if not pi.connected:
-    print("[ERR] pigpio NOT connected!")
+    print("[ERR] pigpio failed to connect. Make sure pigpiod is running.")
 else:
     print("[MAIN] pigpio connected.")
 
-# ===========================================================
-# SERVO WRITE
-# ===========================================================
+current_mode = "button"   # "button" | "fsr" | "wire"
+push_state = False        # False=open, True=closed
+
+_last_push_time = 0.0
+_push_lock = threading.Lock()
+
+# ----------------------------
+# Helper: servo write
+# ----------------------------
 def servo_write(pin, angle):
-    pw = 500 + (angle / 180.0) * 2000
-    pi.set_servo_pulsewidth(pin, pw)
+    # clamp
+    if angle < 0: angle = 0
+    if angle > 180: angle = 180
+    pulse = int(500 + (angle / 180.0) * 2000)  # 500..2500 us
+    pi.set_servo_pulsewidth(pin, pulse)
 
 def servo_off(pin):
     pi.set_servo_pulsewidth(pin, 0)
 
-# ===========================================================
-# GET AVERAGED CURRENT
-# ===========================================================
+# ----------------------------
+# Current averaging (3 reads)
+# ----------------------------
 def get_avg_current_finger():
-    vals = []
+    samples = []
     for _ in range(3):
         try:
-            vals.append(data.get_finger_current())
-        except:
-            vals.append(0)
+            samples.append(data.get_finger_current())
+        except Exception as e:
+            samples.append(0.0)
         time.sleep(0.004)
-    avg = sum(vals) / len(vals)
-    print(f"[CURRENT-FINGER] {avg} mA")
+    avg = sum(samples) / len(samples)
+    print(f"[CURRENT-FINGER] {avg:.1f} mA")
     return avg
 
 def get_avg_current_thumb():
-    vals = []
+    samples = []
     for _ in range(3):
         try:
-            vals.append(data.get_thumb_current())
-        except:
-            vals.append(0)
+            samples.append(data.get_thumb_current())
+        except Exception as e:
+            samples.append(0.0)
         time.sleep(0.004)
-    avg = sum(vals) / len(vals)
-    print(f"[CURRENT-THUMB] {avg} mA")
+    avg = sum(samples) / len(samples)
+    print(f"[CURRENT-THUMB] {avg:.1f} mA")
     return avg
 
-# ===========================================================
-# CLOSE WITH CURRENT LOGIC
-# ===========================================================
+# ----------------------------
+# Close until grip logic
+# ----------------------------
 def close_until_grip(pin, is_thumb=False):
-    print(f"[SERVO] Closing pin {pin}")
+    """
+    Move servo from 0 -> MAX_ANGLE in steps. Stop early when averaged current
+    crosses threshold (debounced by requiring 1 reading here because averaging is done).
+    """
+    print(f"[ACTION] Closing pin {pin}  (thumb={is_thumb})")
+    threshold = GRIP_THRESHOLD_THUMB if is_thumb else GRIP_THRESHOLD_FINGER
+    consec = 0
+    consec_req = 2   # require 2 consecutive high readings to avoid false positive
 
-    for ang in range(0, MAX_ANGLE+1, STEP):
+    for ang in range(0, MAX_ANGLE + 1, STEP):
         servo_write(pin, ang)
         time.sleep(STEP_DELAY)
 
         curr = get_avg_current_thumb() if is_thumb else get_avg_current_finger()
+        if curr >= threshold:
+            consec += 1
+            print(f"[CHECK] current {curr:.1f} >= {threshold}  (consec {consec}/{consec_req})")
+        else:
+            consec = 0
 
-        if curr >= (GRIP_THRESHOLD_THUMB if is_thumb else GRIP_THRESHOLD_FINGER):
-            print(f"[GRIP] STOP @ angle {ang}, current={curr} mA")
+        if consec >= consec_req:
+            print(f"[GRIP] Detected on pin {pin} at angle {ang} (current {curr:.1f} mA). Stopping.")
             return True
 
-    print("[GRIP] FULL CLOSED")
+    print(f"[GRIP] Completed full close on pin {pin} (no threshold triggered).")
     return False
 
-
+# ----------------------------
+# Open servo fully
+# ----------------------------
 def open_finger(pin):
-    print(f"[SERVO] Opening pin {pin}")
+    print(f"[ACTION] Opening pin {pin}")
     for ang in range(MAX_ANGLE, -1, -STEP):
         servo_write(pin, ang)
         time.sleep(STEP_DELAY)
-    print("[SERVO] Fully opened")
+    print(f"[ACTION] Pin {pin} opened to 0")
 
-# ===========================================================
-# GROUP CONTROLS
-# ===========================================================
+# ----------------------------
+# Group operations
+# ----------------------------
 def all_close():
-    print("[ACTION] ALL FINGERS CLOSE")
+    print("[GROUP] All close started")
+    # thumb has its own INA - do it first
     close_until_grip(PIN_THUMB, is_thumb=True)
-    close_until_grip(PIN_IM)
-    close_until_grip(PIN_RP)
+    # then the rest (shared INA)
+    close_until_grip(PIN_IM, is_thumb=False)
+    close_until_grip(PIN_RP, is_thumb=False)
+    print("[GROUP] All close finished")
 
 def all_open():
-    print("[ACTION] ALL FINGERS OPEN")
+    print("[GROUP] All open started")
     open_finger(PIN_THUMB)
     open_finger(PIN_IM)
     open_finger(PIN_RP)
+    print("[GROUP] All open finished")
 
-# Individual wireless controls
+# Wireless single controls (direct, blocking like before)
 def thumb_on(): close_until_grip(PIN_THUMB, is_thumb=True)
 def thumb_off(): open_finger(PIN_THUMB)
 
-def im_on(): close_until_grip(PIN_IM)
+def im_on(): close_until_grip(PIN_IM, is_thumb=False)
 def im_off(): open_finger(PIN_IM)
 
-def rp_on(): close_until_grip(PIN_RP)
+def rp_on(): close_until_grip(PIN_RP, is_thumb=False)
 def rp_off(): open_finger(PIN_RP)
 
 def all_on(): all_close()
 def all_off(): all_open()
 
-# ===========================================================
-# MODE MANAGEMENT
-# ===========================================================
-current_mode = "button"
-push_state = False
-
+# ----------------------------
+# Mode management
+# ----------------------------
 def set_mode(m):
     global current_mode
     current_mode = m
-    print(f"[MODE] Changed to: {m}")
+    print(f"[MODE] set to: {m}")
 
-# ===========================================================
-# PUSH BUTTON HANDLER
-# ===========================================================
-def _handle_push(channel):
-    global push_state
+# ----------------------------
+# Push button callback using pigpio
+# ----------------------------
+def _push_callback(gpio, level, tick):
+    """
+    pigpio callback: level 0 = falling, 1 = rising, 2 = watchdog timeout
+    We want falling edge when button is pulled to ground (assuming pull-up).
+    Debounce using timestamp and a lock to avoid concurrency.
+    """
+    global _last_push_time, push_state
 
-    if current_mode != "button":
-        print("[BTN] Ignored - Not in button mode")
+    if level != 0:   # only act on falling
         return
 
-    print("[BTN] Press detected")
+    now = time.time()
+    with _push_lock:
+        if (now - _last_push_time) < PUSH_DEBOUNCE_SEC:
+            # debounced
+            print("[PUSH] Ignored bounce")
+            return
+        _last_push_time = now
 
-    if not push_state:
-        all_close()
-        push_state = True
-    else:
-        all_open()
-        push_state = False
+    print("[PUSH] Press detected (pigpio callback)")
 
+    # run action in a thread (do not block callback)
+    def _toggle_all():
+        global push_state
+        if current_mode != "button":
+            print("[PUSH] Ignored: not in 'button' mode")
+            return
+
+        if not push_state:
+            print("[PUSH] Action: closing all (push)")
+            all_close()
+            push_state = True
+            print("[PUSH] State after close: closed")
+        else:
+            print("[PUSH] Action: opening all (push)")
+            all_open()
+            push_state = False
+            print("[PUSH] State after open: open")
+
+    threading.Thread(target=_toggle_all, daemon=True).start()
+
+# ----------------------------
+# Setup pigpio input pull-up and callback
+# ----------------------------
 try:
-    GPIO.add_event_detect(PIN_PUSH, GPIO.FALLING,
-                          callback=_handle_push, bouncetime=250)
-    print("[MAIN] Push button interrupt enabled")
+    # set pin mode and pull-up
+    pi.set_mode(PIN_PUSH, pigpio.INPUT)
+    pi.set_pull_up_down(PIN_PUSH, pigpio.PUD_UP)
+    # cancel any previous callbacks on that gpio
+    # register new callback
+    pi.callback(PIN_PUSH, pigpio.FALLING_EDGE, _push_callback)
+    print("[MAIN] pigpio callback for push button registered on GPIO", PIN_PUSH)
 except Exception as e:
-    print("[ERR] Failed to set interrupt:", e)
+    print("[ERR] Failed to register pigpio callback for push button:", e)
 
-# ===========================================================
-# WRIST + ELBOW LOOP
-# ===========================================================
+# ----------------------------
+# Joint thread: wrist & elbow from potentiometers (data.get_wrist_angle/get_elbow_angle)
+# ----------------------------
 def joint_loop():
+    print("[THREAD] joint_loop started")
+    # basic smoothing variables
+    wrist_pos = 90.0
+    elbow_pos = 90.0
+    alpha = 0.20    # smoothing factor
     while True:
-        wp = data.get_wrist_angle()
-        ep = data.get_elbow_angle()
+        try:
+            wp = data.get_wrist_angle()   # 0..100 percent
+            ep = data.get_elbow_angle()
+        except Exception as e:
+            wp = (wrist_pos / 180.0) * 100.0
+            ep = (elbow_pos / 180.0) * 100.0
 
-        servo_write(PIN_WRIST, int((wp/100)*180))
-        servo_write(PIN_ELBOW, int((ep/100)*180))
+        target_w = (wp / 100.0) * 180.0
+        target_e = (ep / 100.0) * 180.0
 
-        print(f"[JOINT] Wrist={wp}%, Elbow={ep}%")
-        time.sleep(0.05)
+        wrist_pos = wrist_pos * (1 - alpha) + target_w * alpha
+        elbow_pos = elbow_pos * (1 - alpha) + target_e * alpha
+
+        servo_write(PIN_WRIST, int(wrist_pos))
+        servo_write(PIN_ELBOW, int(elbow_pos))
+
+        print(f"[JOINT] Wrist={wp:.1f}%, Elbow={ep:.1f}%  -> angles {int(wrist_pos)},{int(elbow_pos)}")
+        time.sleep(0.06)
 
 threading.Thread(target=joint_loop, daemon=True).start()
 
-# ===========================================================
-# FSR LOOP
-# ===========================================================
+# ----------------------------
+# FSR mode loop: monitors trigger FSR (if mode == fsr)
+# ----------------------------
 def fsr_loop():
+    print("[THREAD] fsr_loop started")
     while True:
         if current_mode == "fsr":
-            trig = data.get_trigger_fsr()
-            print("[FSR] Trigger =", trig)
-
+            try:
+                trig = data.get_trigger_fsr()
+            except Exception as e:
+                trig = False
+            print(f"[FSR] trigger = {trig}")
             if trig:
                 all_close()
             else:
                 all_open()
-
         time.sleep(0.05)
 
 threading.Thread(target=fsr_loop, daemon=True).start()
 
-# ===========================================================
-# MAIN ENTRY
-# ===========================================================
+# ----------------------------
+# Main entry
+# ----------------------------
 if __name__ == "__main__":
-    print("[MAIN] NeoArm started")
+    print("[MAIN] NeoArm starting")
     set_mode(current_mode)
 
-    print("[MAIN] Launching webserver…")
+    # Start webserver as subprocess (keeps your previous webserver flow)
+    print("[MAIN] launching webserver subprocess")
     subprocess.Popen(["python3", "/home/rohit/NeoArm/webserver.py"])
 
     try:
         while True:
-            time.sleep(1)
+            # print a simple heartbeat / feedback every few seconds
+            try:
+                fb = data.get_all_feedback()
+                print(f"[FEED] Temp={fb.get('temperature')}C  Palm={fb.get('palm_pressure')}%  Batt={fb.get('battery_percent')}% {fb.get('battery_voltage')}V")
+            except Exception as e:
+                print("[FEED] read failed:", e)
+            time.sleep(2.5)
+
     except KeyboardInterrupt:
-        print("[MAIN] Shutdown")
+        print("[MAIN] KeyboardInterrupt: shutting down")
         servo_off(PIN_THUMB)
         servo_off(PIN_IM)
         servo_off(PIN_RP)
         servo_off(PIN_WRIST)
         servo_off(PIN_ELBOW)
-        GPIO.cleanup()
+        # remove pigpio callbacks and stop
+        try:
+            pi.set_mode(PIN_PUSH, pigpio.INPUT)
+        except:
+            pass
         pi.stop()
+        print("[MAIN] Exit complete")
