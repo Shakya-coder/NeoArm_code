@@ -1,147 +1,183 @@
 #!/usr/bin/env python3
 """
-main.py - start hardware + webserver + loops.
-Run inside venv: python3 main.py
+webserver.py - small HTTP server used by main.py (runs in-thread).
+Provides: /, /mode/<m>, /toggle/<finger>, /status, /feedback
 """
 
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import unquote
 import time
-import threading
-import subprocess
-import RPi.GPIO as GPIO
-import pigpio
 
-import data
-import hardware
-import webserver
-
-# Pin assignment (confirmed)
-PIN_WRIST = 23
-PIN_ELBOW = 24
-PIN_PUSH = 27  # GND -> Button -> GPIO27
-
-# Setup GPIO for push button
-GPIO.setmode(GPIO.BCM)
-GPIO.setwarnings(False)
-GPIO.setup(PIN_PUSH, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-
-# remove old detect if exists
+# Try to import hardware + data. If main.py started everything, these will exist.
 try:
-    GPIO.remove_event_detect(PIN_PUSH)
-except Exception:
-    pass
-
-# Start pigpio daemon externally (ensure pigpiod running). Create pigpio instance.
-pi = pigpio.pi()
-if not pi.connected:
-    print("[MAIN] ERROR: pigpio daemon not available. Start `sudo pigpiod` then run this script.")
-else:
-    print("[MAIN] pigpio connected.")
-
-# Attach pigpio to hardware module
-hardware.attach_pigpio(pi)
-
-# mode and push state
-current_mode = "button"
-push_state = False
-
-def set_mode(m):
-    global current_mode
-    current_mode = m
-    hardware.set_mode(m)
-    print(f"[MAIN] Mode changed to: {m}")
-
-# push button callback
-def _handle_push(channel):
-    global push_state
-    # only act in button mode
-    if current_mode != "button":
-        print("[MAIN] Button pressed but current mode is not 'button', ignored.")
-        return
-    print("[MAIN] Push button pressed (GPIO27)")
-    if not push_state:
-        print("[MAIN] Button-> closing all fingers")
-        hardware.all_close()
-        push_state = True
-    else:
-        print("[MAIN] Button-> opening all fingers")
-        hardware.all_open()
-        push_state = False
-
-# register event detect (debounce)
-try:
-    GPIO.add_event_detect(PIN_PUSH, GPIO.FALLING, callback=_handle_push, bouncetime=200)
-    print("[MAIN] Push button interrupt enabled on GPIO27")
+    import hardware
+    import data
+    REAL = True
+    print("[WEB] hardware + data modules imported (REAL mode).")
 except Exception as e:
-    print("[MAIN] ERROR enabling push button interrupt:", e)
+    hardware = None
+    data = None
+    REAL = False
+    print("[WEB] Running in SIMULATION MODE:", e)
 
-# joint thread (wrist + elbow)
-def joint_loop():
-    while True:
-        try:
-            wp = data.get_wrist_angle()
-            ep = data.get_elbow_angle()
-            # Map percent to pulsewidth and write with pigpio directly
-            if hardware.pi is not None:
-                pw_wrist = int(500 + (wp / 100.0) * 2000)
-                pw_elbow = int(500 + (ep / 100.0) * 2000)
-                hardware.pi.set_servo_pulsewidth(PIN_WRIST, pw_wrist)
-                hardware.pi.set_servo_pulsewidth(PIN_ELBOW, pw_elbow)
-            print(f"[JOINT] Wrist={wp:.1f}%, Elbow={ep:.1f}%")
-        except Exception as e:
-            print("[JOINT] error:", e)
-        time.sleep(0.05)
+# internal state
+current_mode = "button"
+button_states = {"thumb": False, "im": False, "rp": False, "all": False}
 
-threading.Thread(target=joint_loop, daemon=True).start()
+def set_all(state):
+    button_states["all"] = state
+    button_states["thumb"] = state
+    button_states["im"] = state
+    button_states["rp"] = state
 
-# FSR loop - auto-grip
-def fsr_loop():
-    while True:
-        try:
-            if current_mode == "fsr":
-                pressed = data.get_trigger_fsr()
-                if pressed:
-                    print("[FSR] pressed -> all_close")
-                    hardware.all_close()
+# small HTML UI
+HTML = """<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>NeoArm</title>
+<style>body{font-family:Arial;padding:12px;max-width:720px;margin:auto}button{margin:6px;padding:8px 12px}</style>
+</head>
+<body>
+<h2>NeoArm Control</h2>
+<div>
+Mode:
+<button id="m_f" onclick="setMode('fsr')">EMG</button>
+<button id="m_b" onclick="setMode('button')">Push Button</button>
+<button id="m_w" onclick="setMode('wire')">Wireless</button>
+</div>
+
+<h3>Fingers</h3>
+<div>
+<button id="btn_thumb" onclick="toggle('thumb')">Thumb</button>
+<button id="btn_im" onclick="toggle('im')">Index+Middle</button>
+<button id="btn_rp" onclick="toggle('rp')">Ring+Pinky</button>
+<button id="btn_all" onclick="toggle('all')">All</button>
+</div>
+
+<h3>Feedback</h3>
+<div>
+<p>Pressure: <span id="p">--</span>%</p>
+<p>Temperature: <span id="t">--</span>C</p>
+<p>Battery: <span id="bp">--</span>% (<span id="bv">--</span>V)</p>
+</div>
+
+<script>
+function api(path){return fetch(path,{cache:'no-store'}).then(r=>r.json())}
+function setMode(m){ fetch('/mode/'+m).then(()=>refresh()) }
+function toggle(name){ fetch('/toggle/'+name).then(()=>refresh()) }
+function refresh(){
+  api('/status').then(d=>{
+    document.getElementById('p').innerText = d.feedback.palm_pressure;
+    document.getElementById('t').innerText = d.feedback.temperature;
+    document.getElementById('bp').innerText = d.feedback.battery_percent;
+    document.getElementById('bv').innerText = d.feedback.battery_voltage;
+    document.getElementById('btn_thumb').style.background = d.buttons.thumb ? '#2ecc71' : '';
+    document.getElementById('btn_im').style.background = d.buttons.im ? '#2ecc71' : '';
+    document.getElementById('btn_rp').style.background = d.buttons.rp ? '#2ecc71' : '';
+    document.getElementById('btn_all').style.background = d.buttons.all ? '#2ecc71' : '';
+    document.getElementById('m_f').style.background = d.mode==='fsr' ? '#2ecc71' : '';
+    document.getElementById('m_b').style.background = d.mode==='button' ? '#2ecc71' : '';
+    document.getElementById('m_w').style.background = d.mode==='wire' ? '#2ecc71' : '';
+  }).catch(()=>{});
+}
+setInterval(refresh,1000);
+window.onload = refresh;
+</script>
+</body></html>
+"""
+
+class Handler(BaseHTTPRequestHandler):
+    def _send_json(self, code, obj):
+        self.send_response(code)
+        self.send_header('Content-Type','application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(obj).encode())
+
+    def do_GET(self):
+        global current_mode, button_states
+        path = unquote(self.path)
+
+        if path == '/' or path.startswith('/index'):
+            self.send_response(200)
+            self.send_header('Content-Type','text/html; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(HTML.encode())
+            return
+
+        if path.startswith('/mode/'):
+            m = path.split('/mode/')[1]
+            current_mode = m
+            print(f"[WEB] Mode changed -> {m}")
+            if REAL and hardware is not None:
+                try:
+                    hardware.set_mode(m)
+                except Exception as e:
+                    print("[WEB] hardware.set_mode error:", e)
+            self._send_json(200, {'mode': m})
+            return
+
+        if path.startswith('/toggle/'):
+            name = path.split('/toggle/')[1]
+            if name not in button_states:
+                self._send_json(400, {'error': 'invalid finger'})
+                return
+            new_state = not button_states[name]
+            button_states[name] = new_state
+            # sync 'all'
+            if name == 'all':
+                set_all(new_state)
+            else:
+                if not new_state:
+                    button_states['all'] = False
                 else:
-                    print("[FSR] released -> all_open")
-                    hardware.all_open()
-        except Exception as e:
-            print("[FSR] error:", e)
-        time.sleep(0.06)
+                    if button_states['thumb'] and button_states['im'] and button_states['rp']:
+                        button_states['all'] = True
 
-threading.Thread(target=fsr_loop, daemon=True).start()
+            print(f"[WEB] Toggle {name} -> {new_state}")
+            if REAL and hardware is not None:
+                try:
+                    if name == 'all':
+                        hardware.all_close() if new_state else hardware.all_open()
+                    else:
+                        func = getattr(hardware, f"{name}_{'on' if new_state else 'off'}")
+                        func()
+                except Exception as e:
+                    print("[WEB] hardware call error:", e)
+            self._send_json(200, button_states)
+            return
 
-# Start webserver in-thread so it can call hardware functions directly
-def start_webserver_thread():
-    print("[MAIN] Starting webserver in-thread...")
-    t = threading.Thread(target=webserver.run, daemon=True)
-    t.start()
-    time.sleep(0.5)
-    print("[MAIN] Webserver started (http://<pi-ip>:8080)")
+        if path == '/status':
+            if REAL and data is not None:
+                try:
+                    fb = data.get_all_feedback()
+                except Exception as e:
+                    print("[WEB] data.get_all_feedback error:", e)
+                    fb = {'palm_pressure': 0, 'temperature': 0, 'battery_percent': 0, 'battery_voltage': 0}
+            else:
+                # simulated feedback
+                fb = {'palm_pressure': 0, 'temperature': 0, 'battery_percent': 0, 'battery_voltage': 0}
+            out = {'mode': current_mode, 'buttons': button_states, 'feedback': fb}
+            self._send_json(200, out)
+            return
 
-if __name__ == "__main__":
-    print("[MAIN] NeoArm starting...")
-    set_mode("button")
-    start_webserver_thread()
+        if path == '/feedback':
+            if REAL and data is not None:
+                try:
+                    fb = data.get_all_feedback()
+                except Exception:
+                    fb = {'palm_pressure': 0, 'temperature': 0, 'battery_percent': 0, 'battery_voltage': 0}
+            else:
+                fb = {'palm_pressure': 0, 'temperature': 0, 'battery_percent': 0, 'battery_voltage': 0}
+            self._send_json(200, fb)
+            return
 
+        self.send_error(404, 'Not found')
+
+def run():
+    addr = ('0.0.0.0', 8080)
+    print(f"[WEB] NeoArm webserver running on http://{addr[0]}:{addr[1]}")
+    server = HTTPServer(addr, Handler)
     try:
-        while True:
-            time.sleep(1)
+        server.serve_forever()
     except KeyboardInterrupt:
-        print("[MAIN] KeyboardInterrupt - shutting down.")
-    finally:
-        print("[MAIN] Cleaning up hardware and GPIO.")
-        try:
-            hardware.shutdown()
-        except Exception:
-            pass
-        try:
-            GPIO.cleanup()
-        except Exception:
-            pass
-        try:
-            if pi is not None:
-                pi.stop()
-        except Exception:
-            pass
-        print("[MAIN] Exit.")
+        server.server_close()
