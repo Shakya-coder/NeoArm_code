@@ -1,160 +1,162 @@
-# hardware.py
-# Servo + grip control. Uses data.get_* for INA219 readings and pigpio for servos.
+#!/usr/bin/env python3
+# main.py  -- starts hardware, data and webserver. Polls push button (no edge detect).
 
 import time
 import threading
+import subprocess
+import RPi.GPIO as GPIO
+import pigpio
+import os
 
-# pigpio instance will be attached from main.py
-pi = None
+import data
+import hardware
+import webserver
 
-# servo pins (BCM)
-PIN_THUMB = 22
-PIN_IM = 18
-PIN_RP = 17
+# -------- pins ----------
+PIN_PUSH = 27   # GND -> Button -> GPIO27
+PIN_WRIST = 23
+PIN_ELBOW = 24
 
-# servo motion settings
-MAX_ANGLE = 180
-STEP = 4
-STEP_DELAY = 0.010   # speed - smaller = faster
+# -------- init GPIO -----
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+GPIO.setup(PIN_PUSH, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
-# threshold (mA)
-GRIP_THRESHOLD = 150.0
-
-# import data module lazily (main imports data anyway)
+# remove stale event if any (safe)
 try:
-    import data
+    GPIO.remove_event_detect(PIN_PUSH)
 except Exception:
-    data = None
+    pass
 
-def attach_pigpio(p):
-    global pi
-    pi = p
-    print("[HARDWARE] pigpio instance attached")
+# -------- pigpio ----------
+pi = pigpio.pi()
+if not pi.connected:
+    print("[MAIN] ERROR: pigpio daemon not available. Start `sudo pigpiod` first.")
+else:
+    print("[MAIN] pigpio connected.")
 
-def _servo_write(pin, angle):
-    """Write angle (0..180) -> pulsewidth (500..2500 us)."""
-    if pi is None:
-        return
-    pulse = 500 + (angle / 180.0) * 2000
+# attach pigpio to hardware module
+hardware.attach_pigpio(pi)
+
+# -------- state ----------
+current_mode = "button"
+push_state_closed = False   # False=open, True=closed
+
+def set_mode(m):
+    global current_mode
+    current_mode = m
+    print(f"[MAIN] Mode changed to: {m}")
     try:
-        pi.set_servo_pulsewidth(pin, int(pulse))
-    except Exception as e:
-        print("[HARDWARE] servo write error:", e)
-
-def servo_off(pin):
-    if pi is None:
-        return
-    try:
-        pi.set_servo_pulsewidth(pin, 0)
+        hardware.set_mode(m)
     except Exception:
         pass
 
-def _avg_thumb_current():
-    # average 3 samples from data.get_thumb_current()
-    vals = []
-    for _ in range(3):
+# -------- joint (wrist+elbow) thread ----------
+def joint_loop():
+    while True:
         try:
-            vals.append(data.get_thumb_current())
-        except Exception:
-            vals.append(0.0)
-        time.sleep(0.006)
-    return sum(vals) / len(vals)
+            wp = data.get_wrist_angle()
+            ep = data.get_elbow_angle()
+            # map percent -> pulsewidth
+            pw_wrist = int(500 + (wp / 100.0) * 2000)
+            pw_elbow = int(500 + (ep / 100.0) * 2000)
+            # write using hardware.pi (same instance)
+            if hardware.pi is not None:
+                try:
+                    hardware.pi.set_servo_pulsewidth(PIN_WRIST, pw_wrist)
+                    hardware.pi.set_servo_pulsewidth(PIN_ELBOW, pw_elbow)
+                except Exception as e:
+                    # fallback to top-level pi if attached there
+                    try:
+                        pi.set_servo_pulsewidth(PIN_WRIST, pw_wrist)
+                        pi.set_servo_pulsewidth(PIN_ELBOW, pw_elbow)
+                    except Exception:
+                        pass
+            print(f"[JOINT] Wrist={wp:.1f}% Elbow={ep:.1f}%")
+        except Exception as e:
+            print("[JOINT] error:", e)
+        time.sleep(0.05)
 
-def _avg_finger_current():
-    # average 3 samples from data.get_finger_current()
-    vals = []
-    for _ in range(3):
+threading.Thread(target=joint_loop, daemon=True).start()
+
+# -------- fsr loop ----------
+def fsr_loop():
+    while True:
         try:
-            vals.append(data.get_finger_current())
-        except Exception:
-            vals.append(0.0)
-        time.sleep(0.006)
-    return sum(vals) / len(vals)
+            if current_mode == "fsr":
+                pressed = data.get_trigger_fsr()
+                if pressed:
+                    print("[FSR] pressed -> close all")
+                    hardware.all_on()
+                else:
+                    print("[FSR] not pressed -> open all")
+                    hardware.all_off()
+        except Exception as e:
+            print("[FSR] error:", e)
+        time.sleep(0.06)
 
-# ---------- finger control ----------
+threading.Thread(target=fsr_loop, daemon=True).start()
 
-def close_thumb_until_grip():
-    """Close thumb servo until thumb INA crosses threshold."""
-    print("[HARDWARE] Closing thumb until grip")
-    for ang in range(0, MAX_ANGLE + 1, STEP):
-        _servo_write(PIN_THUMB, ang)
-        time.sleep(STEP_DELAY)
-        curr = _avg_thumb_current()
-        print(f"[HARDWARE] Thumb angle={ang} current={curr} mA")
-        if curr >= GRIP_THRESHOLD:
-            print("[HARDWARE] Thumb grip detected - stopping")
-            return True
-    print("[HARDWARE] Thumb fully closed (no spike)")
-    return False
+# -------- webserver in-thread ----------
+def start_webserver_thread():
+    print("[MAIN] Starting webserver in-thread...")
+    t = threading.Thread(target=webserver.run, daemon=True)
+    t.start()
+    time.sleep(0.6)
+    print("[MAIN] webserver should be up on port 8080")
 
-def open_thumb():
-    print("[HARDWARE] Opening thumb")
-    for ang in range(MAX_ANGLE, -1, -STEP):
-        _servo_write(PIN_THUMB, ang)
-        time.sleep(STEP_DELAY)
-    print("[HARDWARE] Thumb opened")
+# -------- button poll loop (no event detect) ----------
+def button_poll_loop():
+    global push_state_closed
+    last = GPIO.input(PIN_PUSH)
+    debounce_time = 0.04
+    while True:
+        val = GPIO.input(PIN_PUSH)
+        # button pressed when input goes LOW (button to GND)
+        if val == 0 and last == 1:
+            # simple debounce
+            time.sleep(debounce_time)
+            if GPIO.input(PIN_PUSH) == 0:
+                print("[BTN] Detected press (poll)")
+                # toggle close/open
+                if not push_state_closed:
+                    print("[BTN] Closing all (button)")
+                    hardware.all_on()
+                    push_state_closed = True
+                else:
+                    print("[BTN] Opening all (button)")
+                    hardware.all_off()
+                    push_state_closed = False
+                # wait until release to avoid repeat toggles
+                while GPIO.input(PIN_PUSH) == 0:
+                    time.sleep(0.02)
+        last = val
+        time.sleep(0.02)
 
-def close_fingers_group_until_grip():
-    """
-    Close index+middle and ring+pinky together.
-    Uses group INA (finger INA) to detect a spike and stop both.
-    """
-    print("[HARDWARE] Closing finger group until grip")
-    for ang in range(0, MAX_ANGLE + 1, STEP):
-        _servo_write(PIN_IM, ang)
-        _servo_write(PIN_RP, ang)
-        time.sleep(STEP_DELAY)
-        curr = _avg_finger_current()
-        print(f"[HARDWARE] Group angle={ang} current={curr} mA")
-        if curr >= GRIP_THRESHOLD:
-            print("[HARDWARE] Group grip detected - stopping both")
-            return True
-    print("[HARDWARE] Group fully closed (no spike)")
-    return False
+threading.Thread(target=button_poll_loop, daemon=True).start()
 
-def open_fingers_group():
-    print("[HARDWARE] Opening finger group")
-    for ang in range(MAX_ANGLE, -1, -STEP):
-        _servo_write(PIN_IM, ang)
-        _servo_write(PIN_RP, ang)
-        time.sleep(STEP_DELAY)
-    print("[HARDWARE] Finger group opened")
-
-# high-level helpers (called by main/webserver)
-def thumb_on():
-    close_thumb_until_grip()
-
-def thumb_off():
-    open_thumb()
-
-def im_on():
-    close_fingers_group_until_grip()
-
-def im_off():
-    open_fingers_group()
-
-def rp_on():
-    # same as im (group), keep for API compatibility
-    close_fingers_group_until_grip()
-
-def rp_off():
-    open_fingers_group()
-
-def all_on():
-    # Close thumb, then close group. They will stop on spikes.
-    close_thumb_until_grip()
-    close_fingers_group_until_grip()
-
-def all_off():
-    open_thumb()
-    open_fingers_group()
-
-# utility shutdown
-def shutdown():
+# -------- main ----------
+if __name__ == "__main__":
+    print("[MAIN] NeoArm starting")
+    set_mode("button")
+    start_webserver_thread()
     try:
-        servo_off(PIN_THUMB)
-        servo_off(PIN_IM)
-        servo_off(PIN_RP)
-    except Exception:
-        pass
-    print("[HARDWARE] shutdown complete")
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("[MAIN] Shutting down...")
+    finally:
+        try:
+            hardware.shutdown()
+        except Exception:
+            pass
+        try:
+            GPIO.cleanup()
+        except Exception:
+            pass
+        try:
+            if pi is not None:
+                pi.stop()
+        except Exception:
+            pass
+        print("[MAIN] Exit.")
