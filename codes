@@ -1,13 +1,26 @@
 #!/usr/bin/env python3
-# main.py  -- starts hardware, data and webserver. Polls push button (no edge detect).
-
+"""
+main.py  -- NeoArm controller (starts sensors, hardware and webserver)
+- Push button polling (GPIO27 -> GND)
+- Wrist/Elbow joint loop (potentiometers)
+- FSR (EMG) loop
+- OLED 128x64 @ 0x3C display (SSD1306)
+- Starts webserver in-thread (webserver.py)
+"""
 import time
 import threading
-import subprocess
 import RPi.GPIO as GPIO
 import pigpio
+import subprocess
 import os
 
+# display libs
+import board
+import busio
+from adafruit_ssd1306 import SSD1306_I2C
+from PIL import Image, ImageDraw, ImageFont
+
+# your modules (unchanged)
 import data
 import hardware
 import webserver
@@ -22,7 +35,7 @@ GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
 GPIO.setup(PIN_PUSH, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
-# remove stale event if any (safe)
+# remove any stale detect (safe)
 try:
     GPIO.remove_event_detect(PIN_PUSH)
 except Exception:
@@ -35,38 +48,104 @@ if not pi.connected:
 else:
     print("[MAIN] pigpio connected.")
 
-# attach pigpio to hardware module
+# attach pigpio to hardware module (so hardware uses same instance)
 hardware.attach_pigpio(pi)
 
-# -------- state ----------
-current_mode = "button"
+# -------- mode/state ----------
+current_mode = "button"   # default push button
 push_state_closed = False   # False=open, True=closed
 
 def set_mode(m):
     global current_mode
     current_mode = m
     print(f"[MAIN] Mode changed to: {m}")
+    # also inform hardware (if any internal behaviour needed)
     try:
-        hardware.set_mode(m)
+        if hasattr(hardware, "set_mode"):
+            hardware.set_mode(m)
     except Exception:
         pass
+
+# -------- OLED init (SSD1306 128x64 at 0x3C) ----------
+try:
+    i2c = busio.I2C(board.SCL, board.SDA)
+    OLED_ADDR = 0x3C
+    oled = SSD1306_I2C(128, 64, i2c, addr=OLED_ADDR)
+    oled.fill(0)
+    oled.show()
+    font = ImageFont.load_default()
+    oled_ok = True
+    print("[MAIN] OLED initialized (128x64 @ 0x3C)")
+except Exception as e:
+    oled = None
+    font = None
+    oled_ok = False
+    print("[MAIN] OLED NOT available:", e)
+
+def update_oled(feedback=None, mode_text=None):
+    """Write feedback dictionary to OLED."""
+    if not oled_ok:
+        return
+    try:
+        if feedback is None:
+            try:
+                feedback = data.get_all_feedback()
+            except Exception:
+                feedback = {"temperature": 0, "palm_pressure": 0, "battery_percent": 0, "battery_voltage": 0}
+        if mode_text is None:
+            mode_text = current_mode
+
+        img = Image.new("1", (128, 64))
+        draw = ImageDraw.Draw(img)
+
+        draw.text((0, 0), "NeoArm Status", font=font, fill=255)
+        # 2nd line - temperature
+        t = feedback.get("temperature", 0)
+        draw.text((0, 16), f"Temp: {t:.1f} C", font=font, fill=255)
+        # 3rd line - palm pressure
+        p = feedback.get("palm_pressure", 0)
+        draw.text((0, 28), f"Palm: {p:.1f} %", font=font, fill=255)
+        # 4th line - battery
+        bp = feedback.get("battery_percent", 0)
+        bv = feedback.get("battery_voltage", 0)
+        draw.text((0, 40), f"Batt: {bp:.0f}% ({bv:.2f}V)", font=font, fill=255)
+        # 5th line - mode
+        draw.text((0, 52), f"Mode: {mode_text}", font=font, fill=255)
+
+        oled.image(img)
+        oled.show()
+    except Exception as e:
+        print("[OLED] update error:", e)
+
+# OLED update thread
+def oled_loop():
+    while True:
+        try:
+            fb = data.get_all_feedback()
+            update_oled(feedback=fb, mode_text=current_mode)
+        except Exception as e:
+            # print once in a while
+            print("[OLED] read/update error:", e)
+        time.sleep(0.7)
+
+if oled_ok:
+    threading.Thread(target=oled_loop, daemon=True).start()
 
 # -------- joint (wrist+elbow) thread ----------
 def joint_loop():
     while True:
         try:
-            wp = data.get_wrist_angle()
+            wp = data.get_wrist_angle()   # 0..100
             ep = data.get_elbow_angle()
-            # map percent -> pulsewidth
             pw_wrist = int(500 + (wp / 100.0) * 2000)
             pw_elbow = int(500 + (ep / 100.0) * 2000)
             # write using hardware.pi (same instance)
-            if hardware.pi is not None:
+            if getattr(hardware, "pi", None) is not None:
                 try:
                     hardware.pi.set_servo_pulsewidth(PIN_WRIST, pw_wrist)
                     hardware.pi.set_servo_pulsewidth(PIN_ELBOW, pw_elbow)
-                except Exception as e:
-                    # fallback to top-level pi if attached there
+                except Exception:
+                    # fallback to top-level pi
                     try:
                         pi.set_servo_pulsewidth(PIN_WRIST, pw_wrist)
                         pi.set_servo_pulsewidth(PIN_ELBOW, pw_elbow)
@@ -112,9 +191,9 @@ def button_poll_loop():
     debounce_time = 0.04
     while True:
         val = GPIO.input(PIN_PUSH)
-        # button pressed when input goes LOW (button to GND)
+        # pressed when input goes LOW (button pulled to GND)
         if val == 0 and last == 1:
-            # simple debounce
+            # debounce
             time.sleep(debounce_time)
             if GPIO.input(PIN_PUSH) == 0:
                 print("[BTN] Detected press (poll)")
@@ -127,7 +206,7 @@ def button_poll_loop():
                     print("[BTN] Opening all (button)")
                     hardware.all_off()
                     push_state_closed = False
-                # wait until release to avoid repeat toggles
+                # wait until release to avoid bouncing toggles
                 while GPIO.input(PIN_PUSH) == 0:
                     time.sleep(0.02)
         last = val
@@ -135,11 +214,12 @@ def button_poll_loop():
 
 threading.Thread(target=button_poll_loop, daemon=True).start()
 
-# -------- main ----------
+# -------- MAIN ----------
 if __name__ == "__main__":
     print("[MAIN] NeoArm starting")
     set_mode("button")
     start_webserver_thread()
+
     try:
         while True:
             time.sleep(1)
