@@ -1,192 +1,139 @@
 #!/usr/bin/env python3
-# webserver.py - small control UI for NeoArm
-# Endpoints:
-#  - /           -> UI
-#  - /mode/<m>   -> set mode (fsr, button, wire)
-#  - /thumb/on   /thumb/off   (same for im, rp, all)
-#  - /feedback   -> JSON feedback
-#  - /status     -> status (mode, buttons, feedback)
-
-import json
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import unquote
 import time
+import pigpio
+import RPi.GPIO as GPIO
+from adafruit_ina219 import INA219
+import board
+import busio
+
+# ============================
+# HARDWARE CONFIG
+# ============================
+
+PIN_SERVO = 22        # Servo test pin
+PIN_BUTTON = 27       # Push button to GND
+INA_ADDR = 0x40       # INA219 current sensor
+
+MAX_ANGLE = 180
+STEP = 4
+STEP_DELAY = 0.010
+GRIP_THRESHOLD = 1500   # mA stop threshold
+
+# ============================
+# INIT GPIO
+# ============================
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+GPIO.setup(PIN_BUTTON, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+# ============================
+# INIT pigpio
+# ============================
+
+pi = pigpio.pi()
+if not pi.connected:
+    print("ERROR: pigpio is not running")
+    quit()
+
+# ============================
+# INIT INA219
+# ============================
+
+i2c = busio.I2C(board.SCL, board.SDA)
+ina = INA219(i2c, addr=INA_ADDR)
+
+# ============================
+# SERVO FUNCTIONS
+# ============================
+
+def servo_write(angle):
+    pulse = 500 + (angle / 180.0) * 2000
+    pi.set_servo_pulsewidth(PIN_SERVO, pulse)
+
+def servo_off():
+    pi.set_servo_pulsewidth(PIN_SERVO, 0)
+
+# ============================
+# READ CURRENT (3 sample avg)
+# ============================
+
+def get_avg_current():
+    values = []
+    for _ in range(3):
+        try:
+            values.append(ina.current)
+        except:
+            values.append(0)
+        time.sleep(0.005)
+    return sum(values) / len(values)
+
+# ============================
+# CLOSE UNTIL GRIP
+# ============================
+
+def close_until_grip():
+    print("ACTION: Closing servo...")
+    for ang in range(0, MAX_ANGLE + 1, STEP):
+        servo_write(ang)
+        time.sleep(STEP_DELAY)
+
+        curr = get_avg_current()
+        print("Angle =", ang, "Current =", curr, "mA")
+
+        if curr >= GRIP_THRESHOLD:
+            print("GRIP DETECTED at angle", ang, "current", curr)
+            return
+
+    print("Reached full close. No grip detected.")
+
+# ============================
+# OPEN
+# ============================
+
+def open_servo():
+    print("ACTION: Opening servo...")
+    for ang in range(MAX_ANGLE, -1, -STEP):
+        servo_write(ang)
+        time.sleep(STEP_DELAY)
+    print("Servo fully open")
+
+# ============================
+# MAIN
+# ============================
+
+print("--------------------------------------------")
+print("Test: Servo + INA219 grip detection")
+print("Servo pin: GPIO 22")
+print("INA219 address: 0x40")
+print("Push button: GPIO 27 to GND")
+print("Press button to toggle OPEN/CLOSE")
+print("--------------------------------------------")
+
+state = False  # False = open, True = closed
 
 try:
-    import hardware
-    import data
-    REAL = True
-    print("[WEB] hardware + data modules imported (REAL mode).")
-except Exception as e:
-    REAL = False
-    print("[WEB] Running in SIMULATION mode:", e)
+    while True:
+        if GPIO.input(PIN_BUTTON) == 0:
+            time.sleep(0.05)
+            if GPIO.input(PIN_BUTTON) == 0:
+                print("BUTTON PRESSED")
 
-current_mode = "button"
-button_states = {"thumb": False, "im": False, "rp": False, "all": False}
+                if not state:
+                    close_until_grip()
+                    state = True
+                else:
+                    open_servo()
+                    state = False
 
-HTML = """
-<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>NeoArm</title>
-<style>
-body{font-family:Arial;background:#f2f3f7;padding:12px}
-.card{background:white;padding:12px;border-radius:8px;margin-bottom:8px;box-shadow:0 3px 8px rgba(0,0,0,0.06)}
-.btn{padding:8px 12px;border-radius:8px;border:1px solid #aaa;cursor:pointer}
-.btn.on{background:#2ecc71;color:white;border-color:#27ae60}
-.mode-btn.active{background:#2ecc71;color:white}
-</style>
-</head><body>
-<div class="card">
-<h3>Mode</h3>
-<button id="m_fsr" class="mode-btn" onclick="setMode('fsr')">FSR</button>
-<button id="m_button" class="mode-btn" onclick="setMode('button')">Push Button</button>
-<button id="m_wire" class="mode-btn" onclick="setMode('wire')">Wireless</button>
-</div>
+                while GPIO.input(PIN_BUTTON) == 0:
+                    time.sleep(0.05)
 
-<div class="card">
-<h3>Controls</h3>
-<button id="btn_thumb" class="btn" onclick="toggle('thumb')">Thumb</button>
-<button id="btn_im" class="btn" onclick="toggle('im')">Index+Middle</button>
-<button id="btn_rp" class="btn" onclick="toggle('rp')">Ring+Pinky</button>
-<button id="btn_all" class="btn" onclick="toggle('all')">All</button>
-</div>
+        time.sleep(0.01)
 
-<div class="card">
-<h3>Feedback</h3>
-<p>Pressure: <span id="fb_p">--</span>%</p>
-<p>Temperature: <span id="fb_t">--</span>C</p>
-<p>Battery: <span id="fb_bp">--</span>% (<span id="fb_bv">--</span>V)</p>
-</div>
+except KeyboardInterrupt:
+    print("Exiting test...")
+    servo_off()
+    GPIO.cleanup()
+    pi.stop()
 
-<script>
-function api(path){ return fetch(path, {cache:'no-store'}).then(r=>r.json()); }
-function setMode(m){ fetch('/mode/'+m).then(()=>refresh()); }
-function toggle(name){ fetch('/'+name + '/on').then(r=>r.json()).then(d=>refresh()).catch(()=>refresh()); }
-function refresh(){
-    api('/status').then(d=>{
-        document.getElementById('fb_p').innerText = d.feedback.palm_pressure;
-        document.getElementById('fb_t').innerText = d.feedback.temperature;
-        document.getElementById('fb_bp').innerText = d.feedback.battery_percent;
-        document.getElementById('fb_bv').innerText = d.feedback.battery_voltage;
-        // mode buttons
-        document.getElementById('m_fsr').classList.toggle('active', d.mode==='fsr');
-        document.getElementById('m_button').classList.toggle('active', d.mode==='button');
-        document.getElementById('m_wire').classList.toggle('active', d.mode==='wire');
-        // control buttons style
-        ['thumb','im','rp','all'].forEach(k=>{
-            let el = document.getElementById('btn_' + k);
-            el.classList.toggle('on', d.buttons[k]);
-        });
-    }).catch(()=>{});
-}
-setInterval(refresh, 1000);
-window.onload = refresh;
-</script>
-</body></html>
-"""
-
-class Handler(BaseHTTPRequestHandler):
-    def _send_html(self, code=200):
-        self.send_response(code)
-        self.send_header("Content-type","text/html; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(HTML.encode('utf-8'))
-
-    def _send_json(self, obj, code=200):
-        j = json.dumps(obj)
-        self.send_response(code)
-        self.send_header("Content-type","application/json; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(j.encode('utf-8'))
-
-    def do_GET(self):
-        global current_mode, button_states
-        path = unquote(self.path)
-
-        if path == "/" or path.startswith("/index"):
-            return self._send_html()
-
-        # mode change
-        if path.startswith("/mode/"):
-            m = path.split("/mode/")[1]
-            if m in ("fsr","button","wire"):
-                current_mode = m
-                print("[WEB] Mode changed ->", m)
-                if REAL:
-                    try:
-                        hardware.set_mode(m)
-                    except Exception:
-                        pass
-                return self._send_json({"mode": m})
-            return self._send_json({"error":"invalid mode"}, 400)
-
-        # simple finger toggles: /thumb/on or /thumb/off handled here for compatibility
-        parts = path.strip("/").split("/")
-        if len(parts) == 2 and parts[0] in ("thumb","im","rp","all") and parts[1] in ("on","off"):
-            name, action = parts
-            new_state = (action == "on")
-            button_states[name] = new_state
-            # sync 'all' with individuals
-            if name == "all":
-                for k in ("thumb","im","rp"):
-                    button_states[k] = new_state
-            else:
-                button_states["all"] = button_states["thumb"] and button_states["im"] and button_states["rp"]
-            # call hardware
-            if REAL:
-                try:
-                    func_name = f"{name}_{'on' if new_state else 'off'}"
-                    if hasattr(hardware, func_name):
-                        # run in thread to avoid blocking server
-                        getattr(hardware, func_name)()
-                except Exception as e:
-                    print("[WEB] hardware call error:", e)
-            return self._send_json(button_states)
-
-        # compatibility endpoints: /thumb/on (client code in earlier UI may call /thumb/on)
-        if path.startswith("/thumb/") or path.startswith("/im/") or path.startswith("/rp/") or path.startswith("/all/"):
-            parts = path.strip("/").split("/")
-            if len(parts) == 2:
-                name, action = parts
-                new_state = (action == "on")
-                button_states[name] = new_state
-                if REAL:
-                    try:
-                        func_name = f"{name}_{'on' if new_state else 'off'}"
-                        if hasattr(hardware, func_name):
-                            getattr(hardware, func_name)()
-                    except Exception as e:
-                        print("[WEB] hardware call error:", e)
-                return self._send_json(button_states)
-
-        # status -> return mode, buttons, feedback
-        if path == "/status":
-            try:
-                fb = data.get_all_feedback() if REAL else {"palm_pressure":0,"temperature":0,"battery_percent":0,"battery_voltage":0}
-            except Exception:
-                fb = {"palm_pressure":0,"temperature":0,"battery_percent":0,"battery_voltage":0}
-            out = {"mode": current_mode, "buttons": button_states, "feedback": fb}
-            return self._send_json(out)
-
-        # feedback raw
-        if path == "/feedback":
-            try:
-                fb = data.get_all_feedback() if REAL else {"palm_pressure":0,"temperature":0,"battery_percent":0,"battery_voltage":0}
-            except Exception:
-                fb = {"palm_pressure":0,"temperature":0,"battery_percent":0,"battery_voltage":0}
-            return self._send_json(fb)
-
-        self.send_error(404, "Not found: " + path)
-
-def run():
-    addr = ("0.0.0.0", 8080)
-    print("[WEB] NeoArm webserver running on http://0.0.0.0:8080")
-    server = HTTPServer(addr, Handler)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("[WEB] Shutting down")
-        server.server_close()
-
-if __name__ == "__main__":
-    run()
