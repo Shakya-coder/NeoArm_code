@@ -1,242 +1,303 @@
 #!/usr/bin/env python3
-"""
-main.py  -- NeoArm controller (starts sensors, hardware and webserver)
-- Push button polling (GPIO27 -> GND)
-- Wrist/Elbow joint loop (potentiometers)
-- FSR (EMG) loop
-- OLED 128x64 @ 0x3C display (SSD1306)
-- Starts webserver in-thread (webserver.py)
-"""
+# webserver.py
+# Simple, clean webserver for NeoArm (UI like your screenshot).
+
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import unquote
 import time
-import threading
-import RPi.GPIO as GPIO
-import pigpio
-import subprocess
-import os
 
-# display libs
-import board
-import busio
-from adafruit_ssd1306 import SSD1306_I2C
-from PIL import Image, ImageDraw, ImageFont
-
-# your modules (unchanged)
-import data
-import hardware
-import webserver
-
-# -------- pins ----------
-PIN_PUSH = 27   # GND -> Button -> GPIO27
-PIN_WRIST = 23
-PIN_ELBOW = 24
-
-# -------- init GPIO -----
-GPIO.setmode(GPIO.BCM)
-GPIO.setwarnings(False)
-GPIO.setup(PIN_PUSH, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-
-# remove any stale detect (safe)
+# Try to import hardware/data. If missing, simulate.
 try:
-    GPIO.remove_event_detect(PIN_PUSH)
-except Exception:
-    pass
-
-# -------- pigpio ----------
-pi = pigpio.pi()
-if not pi.connected:
-    print("[MAIN] ERROR: pigpio daemon not available. Start `sudo pigpiod` first.")
-else:
-    print("[MAIN] pigpio connected.")
-
-# attach pigpio to hardware module (so hardware uses same instance)
-hardware.attach_pigpio(pi)
-
-# -------- mode/state ----------
-current_mode = "button"   # default push button
-push_state_closed = False   # False=open, True=closed
-
-def set_mode(m):
-    global current_mode
-    current_mode = m
-    print(f"[MAIN] Mode changed to: {m}")
-    # also inform hardware (if any internal behaviour needed)
-    try:
-        if hasattr(hardware, "set_mode"):
-            hardware.set_mode(m)
-    except Exception:
-        pass
-
-# -------- OLED init (SSD1306 128x64 at 0x3C) ----------
-try:
-    i2c = busio.I2C(board.SCL, board.SDA)
-    OLED_ADDR = 0x3C
-    oled = SSD1306_I2C(128, 64, i2c, addr=OLED_ADDR)
-    oled.fill(0)
-    oled.show()
-    font = ImageFont.load_default()
-    oled_ok = True
-    print("[MAIN] OLED initialized (128x64 @ 0x3C)")
+    import data
+    import hardware
+    REAL = True
+    print("[WEB] hardware + data modules imported (REAL mode).")
 except Exception as e:
-    oled = None
-    font = None
-    oled_ok = False
-    print("[MAIN] OLED NOT available:", e)
+    data = None
+    hardware = None
+    REAL = False
+    print("[WEB] Running in SIMULATION MODE:", e)
 
-def update_oled(feedback=None, mode_text=None):
-    """Write feedback dictionary to OLED."""
-    if not oled_ok:
-        return
-    try:
-        if feedback is None:
-            try:
-                feedback = data.get_all_feedback()
-            except Exception:
-                feedback = {"temperature": 0, "palm_pressure": 0, "battery_percent": 0, "battery_voltage": 0}
-        if mode_text is None:
-            mode_text = current_mode
+# internal state
+current_mode = "button"
+button_states = {"thumb": False, "im": False, "rp": False, "all": False}
 
-        img = Image.new("1", (128, 64))
-        draw = ImageDraw.Draw(img)
+def set_all_fingers(state: bool):
+    button_states["all"] = state
+    button_states["thumb"] = state
+    button_states["im"] = state
+    button_states["rp"] = state
 
-        draw.text((0, 0), "NeoArm Status", font=font, fill=255)
-        # 2nd line - temperature
-        t = feedback.get("temperature", 0)
-        draw.text((0, 16), f"Temp: {t:.1f} C", font=font, fill=255)
-        # 3rd line - palm pressure
-        p = feedback.get("palm_pressure", 0)
-        draw.text((0, 28), f"Palm: {p:.1f} %", font=font, fill=255)
-        # 4th line - battery
-        bp = feedback.get("battery_percent", 0)
-        bv = feedback.get("battery_voltage", 0)
-        draw.text((0, 40), f"Batt: {bp:.0f}% ({bv:.2f}V)", font=font, fill=255)
-        # 5th line - mode
-        draw.text((0, 52), f"Mode: {mode_text}", font=font, fill=255)
+def simulated_feedback():
+    t = int(time.time()) % 60
+    return {
+        "pressure": (t % 10) * 10,
+        "temperature": 25 + (t % 5),
+        "battery_percent": 80,
+        "battery_voltage": 11.7
+    }
 
-        oled.image(img)
-        oled.show()
-    except Exception as e:
-        print("[OLED] update error:", e)
+# HTML — simplified and responsive, styled to look like your screenshot
+HTML = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NeoArm Webapplication</title>
+<style>
+:root{--bg:#f6f7fa;--card:#fff;--muted:#9aa0a6;--accent:#2ecc71;--shadow:0 8px 16px rgba(18,18,18,0.06)}
+body{font-family:Arial,Helvetica,sans-serif;background:var(--bg);margin:0;color:#111}
+.topbar{background:var(--card);padding:18px;display:flex;justify-content:space-between;align-items:center;box-shadow:var(--shadow)}
+.title{font-weight:700;font-size:20px}
+.status{display:flex;align-items:center;gap:8px;color:#222}
+.dot{width:12px;height:12px;border-radius:999px;background:#00c853;display:inline-block}
+.container{padding:14px;max-width:820px;margin:0 auto}
+.section{background:var(--card);border-radius:12px;padding:18px;box-shadow:var(--shadow);margin-bottom:14px}
+.h2{font-size:16px;margin:0 0 12px 0;font-weight:700}
+.mode-row{display:flex;gap:10px;align-items:center}
+.mode-btn{background:#fff;border:1px solid #e6e6e6;padding:10px 16px;border-radius:10px;cursor:pointer;color:#111}
+.mode-btn.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+.control-row{display:flex;flex-direction:column;gap:12px}
+.control-item{display:flex;justify-content:space-between;align-items:center;background:#fff;border-radius:10px;padding:14px;border:1px solid #f0f0f0}
+.control-label{font-size:16px;font-weight:600}
+.control-btn{padding:10px 18px;border-radius:10px;border:1px solid #e6e6e6;background:#fff;cursor:pointer;font-weight:700}
+.control-btn.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+.control-btn.disabled{background:#f3f3f3;color:#999;cursor:default;border-color:#eee}
+.feedback-cards{display:flex;flex-direction:column;gap:12px}
+.card-box{background:#0f1114;color:#fff;padding:22px;border-radius:12px}
+.card-title{font-size:18px;font-weight:700;text-align:center;margin-bottom:12px}
+.card-value{font-size:20px;text-align:center;color:#1de9b6}
+.footer-note{font-size:12px;color:var(--muted);text-align:center;padding:8px}
+@media(min-width:720px){ .feedback-cards{flex-direction:row;gap:12px} .card-box{flex:1} }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="title">NeoArm Webapplication<br><span style="font-size:12px;color:var(--muted);font-weight:400">Control & feedback panel</span></div>
+  <div class="status"><span class="dot" id="online_dot"></span><span id="online_text">Online</span></div>
+</div>
 
-# OLED update thread
-def oled_loop():
-    while True:
-        try:
-            fb = data.get_all_feedback()
-            update_oled(feedback=fb, mode_text=current_mode)
-        except Exception as e:
-            # print once in a while
-            print("[OLED] read/update error:", e)
-        time.sleep(0.7)
+<div class="container">
+  <div class="section">
+    <div class="h2">Mode selection</div>
+    <div class="mode-row">
+      <button id="m_fsr" class="mode-btn" onclick="setMode('fsr')">EMG</button>
+      <button id="m_push" class="mode-btn" onclick="setMode('button')">Push Button</button>
+      <button id="m_wire" class="mode-btn" onclick="setMode('wire')">Wireless</button>
+    </div>
+  </div>
 
-if oled_ok:
-    threading.Thread(target=oled_loop, daemon=True).start()
+  <div class="section">
+    <div class="h2">Control panel</div>
+    <div class="control-row">
+      <div class="control-item"><div class="control-label">Thumb</div><button id="btn_thumb" class="control-btn" onclick="toggle('thumb')">OFF</button></div>
+      <div class="control-item"><div class="control-label">Index + Middle</div><button id="btn_im" class="control-btn" onclick="toggle('im')">OFF</button></div>
+      <div class="control-item"><div class="control-label">Ring + Pinky</div><button id="btn_rp" class="control-btn" onclick="toggle('rp')">OFF</button></div>
+      <div class="control-item"><div class="control-label">All Fingers</div><button id="btn_all" class="control-btn" onclick="toggle('all')">OFF</button></div>
+    </div>
+  </div>
 
-# -------- joint (wrist+elbow) thread ----------
-def joint_loop():
-    while True:
-        try:
-            wp = data.get_wrist_angle()   # 0..100
-            ep = data.get_elbow_angle()
-            pw_wrist = int(500 + (wp / 100.0) * 2000)
-            pw_elbow = int(500 + (ep / 100.0) * 2000)
-            # write using hardware.pi (same instance)
-            if getattr(hardware, "pi", None) is not None:
+  <div class="section">
+    <div class="h2">NeoArm Feedback</div>
+    <div class="feedback-cards">
+      <div class="card-box"><div class="card-title">Pressure</div><div class="card-value" id="fb_pressure">--%</div><div style="text-align:center;color:#bdbdbd;margin-top:8px">Palm pressure</div></div>
+      <div class="card-box"><div class="card-title">Temperature</div><div class="card-value" id="fb_temp">-- °C</div><div style="text-align:center;color:#bdbdbd;margin-top:8px">LM35 temperature</div></div>
+      <div class="card-box"><div class="card-title">Battery Status</div><div class="card-value" id="fb_batt_pct">--%</div><div style="text-align:center;color:#bdbdbd;margin-top:8px" id="fb_batt_v">-- V</div></div>
+    </div>
+  </div>
+
+  <div class="footer-note">Tap a control to toggle. The UI auto-syncs every 1s.</div>
+</div>
+
+<script>
+let mode = "button";
+let buttonState = {thumb:false, im:false, rp:false, all:false};
+
+function api_get(path){ return fetch(path, {cache:"no-store"}).then(r => r); }
+
+function setMode(m){
+  mode = m;
+  api_get('/mode/' + encodeURIComponent(m)).then(_ => refreshUI()).catch(_ => refreshUI());
+}
+
+function toggle(name){
+  if(mode !== 'wire') return;
+  const el = document.getElementById('btn_' + name);
+  const isOn = el.classList.contains('on');
+  const action = isOn ? 'off' : 'on';
+  api_get('/' + name + '/' + action)
+    .then(r => r.json()).then(data => updateButtonsFromState(data)).catch(_ => { el.classList.toggle('on'); el.innerText = el.classList.contains('on') ? 'ON' : 'OFF'; });
+}
+
+function updateButtonsFromState(state){
+  ['thumb','im','rp','all'].forEach(k => {
+    const el = document.getElementById('btn_' + k);
+    if(state[k]){ el.classList.add('on'); el.innerText='ON'; } else { el.classList.remove('on'); el.innerText='OFF'; }
+  });
+}
+
+function refreshUI(){
+  api_get('/feedback').then(r => r.json()).then(d => {
+    document.getElementById('fb_pressure').innerText = d.pressure + '%';
+    document.getElementById('fb_temp').innerText = d.temperature + ' °C';
+    document.getElementById('fb_batt_pct').innerText = d.battery_percent + '%';
+    document.getElementById('fb_batt_v').innerText = d.battery_voltage + ' V';
+    document.getElementById('online_dot').style.background = '#00c853';
+    document.getElementById('online_text').innerText = 'Online';
+  }).catch(_ => {
+    document.getElementById('online_dot').style.background = '#999';
+    document.getElementById('online_text').innerText = 'Offline';
+  });
+
+  api_get('/status').then(r => r.json()).then(s => {
+    mode = s.mode || mode;
+    document.getElementById('m_fsr').classList.toggle('active', mode === 'fsr');
+    document.getElementById('m_push').classList.toggle('active', mode === 'button');
+    document.getElementById('m_wire').classList.toggle('active', mode === 'wire');
+    updateButtonsFromState(s.buttons || buttonState);
+    const disabled = (mode !== 'wire');
+    ['thumb','im','rp','all'].forEach(k => {
+      const el = document.getElementById('btn_' + k);
+      if(disabled){ el.classList.remove('on'); el.classList.add('disabled'); el.style.pointerEvents='none'; el.innerText = s.buttons && s.buttons[k] ? 'ON' : 'OFF'; }
+      else { el.classList.remove('disabled'); el.style.pointerEvents='auto'; }
+    });
+  }).catch(_ => {});
+}
+
+setInterval(refreshUI, 1000);
+window.addEventListener('load', refreshUI);
+</script>
+
+</body>
+</html>
+"""
+
+# ------------------------
+# HTTP handler
+# ------------------------
+class Handler(BaseHTTPRequestHandler):
+    def _send_text(self, code, text):
+        self.send_response(code)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(text.encode('utf-8'))
+
+    def _send_json(self, code, obj):
+        j = json.dumps(obj)
+        self.send_response(code)
+        self.send_header("Content-type", "application/json; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(j.encode('utf-8'))
+
+    def do_GET(self):
+        global current_mode, button_states
+
+        path = unquote(self.path)
+        if path == "/" or path.startswith("/index"):
+            self.send_response(200)
+            self.send_header("Content-type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(HTML.encode('utf-8'))
+            return
+
+        # mode change
+        if path.startswith("/mode/"):
+            m = path.split("/mode/")[1].lower()
+            if m in ("fsr","button","wire"):
+                current_mode = "fsr" if m=="fsr" else ("wire" if m=="wire" else "button")
+                # inform main/hardware if possible
                 try:
-                    hardware.pi.set_servo_pulsewidth(PIN_WRIST, pw_wrist)
-                    hardware.pi.set_servo_pulsewidth(PIN_ELBOW, pw_elbow)
-                except Exception:
-                    # fallback to top-level pi
-                    try:
-                        pi.set_servo_pulsewidth(PIN_WRIST, pw_wrist)
-                        pi.set_servo_pulsewidth(PIN_ELBOW, pw_elbow)
-                    except Exception:
-                        pass
-            print(f"[JOINT] Wrist={wp:.1f}% Elbow={ep:.1f}%")
-        except Exception as e:
-            print("[JOINT] error:", e)
-        time.sleep(0.05)
+                    if REAL and hasattr(hardware, "set_mode"):
+                        hardware.set_mode(current_mode)
+                except:
+                    pass
+                print("[WEB] Mode set to:", current_mode)
+                self._send_text(200, "OK")
+                return
+            else:
+                self._send_text(400, "Invalid mode")
+                return
 
-threading.Thread(target=joint_loop, daemon=True).start()
+        # toggle endpoints: /thumb/on etc.
+        parts = path.strip("/").split("/")
+        if len(parts) == 2 and parts[0] in ("thumb","im","rp","all") and parts[1] in ("on","off"):
+            name = parts[0]; action = parts[1]
+            new_state = (action == "on")
+            if name == "all":
+                set_all_fingers(new_state)
+            else:
+                button_states[name] = new_state
+                if name in ("thumb","im","rp") and not new_state:
+                    button_states["all"] = False
+                if name in ("thumb","im","rp") and new_state:
+                    if button_states["thumb"] and button_states["im"] and button_states["rp"]:
+                        button_states["all"] = True
 
-# -------- fsr loop ----------
-def fsr_loop():
-    while True:
-        try:
-            if current_mode == "fsr":
-                pressed = data.get_trigger_fsr()
-                if pressed:
-                    print("[FSR] pressed -> close all")
-                    hardware.all_on()
-                else:
-                    print("[FSR] not pressed -> open all")
-                    hardware.all_off()
-        except Exception as e:
-            print("[FSR] error:", e)
-        time.sleep(0.06)
+            # call hardware functions if available
+            if REAL:
+                try:
+                    func_name = f"{name}_{'on' if new_state else 'off'}"
+                    if hasattr(hardware, func_name):
+                        getattr(hardware, func_name)()
+                    else:
+                        # fallback: call all_on/all_off for 'all'
+                        if name == "all":
+                            if new_state: hardware.all_on()
+                            else: hardware.all_off()
+                except Exception as e:
+                    print("[WEB] hardware call error:", e)
 
-threading.Thread(target=fsr_loop, daemon=True).start()
+            self._send_json(200, button_states.copy())
+            return
 
-# -------- webserver in-thread ----------
-def start_webserver_thread():
-    print("[MAIN] Starting webserver in-thread...")
-    t = threading.Thread(target=webserver.run, daemon=True)
-    t.start()
-    time.sleep(0.6)
-    print("[MAIN] webserver should be up on port 8080")
+        # feedback
+        if path == "/feedback":
+            if REAL:
+                try:
+                    fb = data.get_all_feedback()
+                    resp = {
+                        "pressure": fb.get("palm_pressure"),
+                        "temperature": fb.get("temperature"),
+                        "battery_percent": fb.get("battery_percent"),
+                        "battery_voltage": fb.get("battery_voltage")
+                    }
+                except Exception as e:
+                    resp = simulated_feedback()
+            else:
+                resp = simulated_feedback()
+            self._send_json(200, resp)
+            return
 
-# -------- button poll loop (no event detect) ----------
-def button_poll_loop():
-    global push_state_closed
-    last = GPIO.input(PIN_PUSH)
-    debounce_time = 0.04
-    while True:
-        val = GPIO.input(PIN_PUSH)
-        # pressed when input goes LOW (button pulled to GND)
-        if val == 0 and last == 1:
-            # debounce
-            time.sleep(debounce_time)
-            if GPIO.input(PIN_PUSH) == 0:
-                print("[BTN] Detected press (poll)")
-                # toggle close/open
-                if not push_state_closed:
-                    print("[BTN] Closing all (button)")
-                    hardware.all_on()
-                    push_state_closed = True
-                else:
-                    print("[BTN] Opening all (button)")
-                    hardware.all_off()
-                    push_state_closed = False
-                # wait until release to avoid bouncing toggles
-                while GPIO.input(PIN_PUSH) == 0:
-                    time.sleep(0.02)
-        last = val
-        time.sleep(0.02)
+        # status
+        if path == "/status":
+            if REAL:
+                try:
+                    fb = data.get_all_feedback()
+                except:
+                    fb = simulated_feedback()
+            else:
+                fb = simulated_feedback()
 
-threading.Thread(target=button_poll_loop, daemon=True).start()
+            out = {"mode": current_mode, "buttons": button_states.copy(), "feedback": fb}
+            self._send_json(200, out)
+            return
 
-# -------- MAIN ----------
-if __name__ == "__main__":
-    print("[MAIN] NeoArm starting")
-    set_mode("button")
-    start_webserver_thread()
+        self.send_error(404, "Not found: " + path)
+        return
 
+# ------------------------
+# Start server
+# ------------------------
+def run():
+    addr = ("0.0.0.0", 8080)
+    server = HTTPServer(addr, Handler)
+    print(f"[WEB] NeoArm webserver running on http://{addr[0]}:{addr[1]}")
     try:
-        while True:
-            time.sleep(1)
+        server.serve_forever()
     except KeyboardInterrupt:
-        print("[MAIN] Shutting down...")
-    finally:
-        try:
-            hardware.shutdown()
-        except Exception:
-            pass
-        try:
-            GPIO.cleanup()
-        except Exception:
-            pass
-        try:
-            if pi is not None:
-                pi.stop()
-        except Exception:
-            pass
-        print("[MAIN] Exit.")
+        print("\n[WEB] Shutting down.")
+        server.server_close()
+
+if __name__ == "__main__":
+    run()
