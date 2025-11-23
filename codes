@@ -1,139 +1,149 @@
-#!/usr/bin/env python3
+# webserver.py
+# Minimal webserver that can call hardware functions directly
+
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import unquote
 import time
-import pigpio
-import RPi.GPIO as GPIO
-from adafruit_ina219 import INA219
-import board
-import busio
-
-# ============================
-# HARDWARE CONFIG
-# ============================
-
-PIN_SERVO = 22        # Servo test pin
-PIN_BUTTON = 27       # Push button to GND
-INA_ADDR = 0x40       # INA219 current sensor
-
-MAX_ANGLE = 180
-STEP = 4
-STEP_DELAY = 0.010
-GRIP_THRESHOLD = 1500   # mA stop threshold
-
-# ============================
-# INIT GPIO
-# ============================
-
-GPIO.setmode(GPIO.BCM)
-GPIO.setwarnings(False)
-GPIO.setup(PIN_BUTTON, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-
-# ============================
-# INIT pigpio
-# ============================
-
-pi = pigpio.pi()
-if not pi.connected:
-    print("ERROR: pigpio is not running")
-    quit()
-
-# ============================
-# INIT INA219
-# ============================
-
-i2c = busio.I2C(board.SCL, board.SDA)
-ina = INA219(i2c, addr=INA_ADDR)
-
-# ============================
-# SERVO FUNCTIONS
-# ============================
-
-def servo_write(angle):
-    pulse = 500 + (angle / 180.0) * 2000
-    pi.set_servo_pulsewidth(PIN_SERVO, pulse)
-
-def servo_off():
-    pi.set_servo_pulsewidth(PIN_SERVO, 0)
-
-# ============================
-# READ CURRENT (3 sample avg)
-# ============================
-
-def get_avg_current():
-    values = []
-    for _ in range(3):
-        try:
-            values.append(ina.current)
-        except:
-            values.append(0)
-        time.sleep(0.005)
-    return sum(values) / len(values)
-
-# ============================
-# CLOSE UNTIL GRIP
-# ============================
-
-def close_until_grip():
-    print("ACTION: Closing servo...")
-    for ang in range(0, MAX_ANGLE + 1, STEP):
-        servo_write(ang)
-        time.sleep(STEP_DELAY)
-
-        curr = get_avg_current()
-        print("Angle =", ang, "Current =", curr, "mA")
-
-        if curr >= GRIP_THRESHOLD:
-            print("GRIP DETECTED at angle", ang, "current", curr)
-            return
-
-    print("Reached full close. No grip detected.")
-
-# ============================
-# OPEN
-# ============================
-
-def open_servo():
-    print("ACTION: Opening servo...")
-    for ang in range(MAX_ANGLE, -1, -STEP):
-        servo_write(ang)
-        time.sleep(STEP_DELAY)
-    print("Servo fully open")
-
-# ============================
-# MAIN
-# ============================
-
-print("--------------------------------------------")
-print("Test: Servo + INA219 grip detection")
-print("Servo pin: GPIO 22")
-print("INA219 address: 0x40")
-print("Push button: GPIO 27 to GND")
-print("Press button to toggle OPEN/CLOSE")
-print("--------------------------------------------")
-
-state = False  # False = open, True = closed
 
 try:
-    while True:
-        if GPIO.input(PIN_BUTTON) == 0:
-            time.sleep(0.05)
-            if GPIO.input(PIN_BUTTON) == 0:
-                print("BUTTON PRESSED")
+    import hardware
+    import data
+    REAL = True
+    print("[WEB] hardware + data modules imported (REAL mode).")
+except Exception as e:
+    hardware = None
+    data = None
+    REAL = False
+    print("[WEB] Running in SIMULATION MODE:", e)
 
-                if not state:
-                    close_until_grip()
-                    state = True
-                else:
-                    open_servo()
-                    state = False
+# state
+current_mode = "button"
+button_states = {"thumb": False, "im": False, "rp": False, "all": False}
 
-                while GPIO.input(PIN_BUTTON) == 0:
-                    time.sleep(0.05)
+def set_all_buttons(state):
+    button_states["all"] = state
+    button_states["thumb"] = state
+    button_states["im"] = state
+    button_states["rp"] = state
 
-        time.sleep(0.01)
+# simulation feedback
+def simulated_feedback():
+    t = int(time.time()) % 60
+    return {
+        "pressure": (t % 10) * 10,
+        "temperature": 25 + (t % 5),
+        "battery_percent": 80,
+        "battery_voltage": 11.7
+    }
 
-except KeyboardInterrupt:
-    print("Exiting test...")
-    servo_off()
-    GPIO.cleanup()
-    pi.stop()
+HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>NeoArm</title></head><body>
+<h2>NeoArm Control</h2>
+<p>Use the endpoints: /mode/<fsr|button|wire>, /toggle/<thumb|im|rp|all>, /status, /feedback</p>
+</body></html>
+"""
 
+class Handler(BaseHTTPRequestHandler):
+    def _json(self, code, obj):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(json.dumps(obj).encode())
+
+    def _text(self, code, txt):
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(txt.encode())
+
+    def do_GET(self):
+        global current_mode, button_states
+        path = unquote(self.path)
+
+        if path == "/" or path == "/index":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(HTML.encode())
+            return
+
+        if path.startswith("/mode/"):
+            m = path.split("/mode/")[1]
+            if m in ("fsr","button","wire"):
+                current_mode = m
+                print(f"[WEB] Mode changed -> {m}")
+                if REAL and hasattr(hardware, "set_mode"):
+                    try:
+                        hardware.set_mode(m)
+                    except Exception:
+                        pass
+                self._text(200, "OK")
+            else:
+                self._text(400, "Invalid mode")
+            return
+
+        if path.startswith("/toggle/"):
+            name = path.split("/toggle/")[1]
+            if name not in button_states:
+                self._json(400, {"error":"invalid"})
+                return
+            new_state = not button_states[name]
+            button_states[name] = new_state
+            if name == "all":
+                set_all_buttons(new_state)
+            print(f"[WEB] toggle {name} -> {new_state}")
+
+            # call hardware
+            if REAL:
+                try:
+                    if name == "all":
+                        hardware.all_on() if new_state else hardware.all_off()
+                    else:
+                        func = getattr(hardware, f"{name}_{'on' if new_state else 'off'}")
+                        func()
+                except Exception as e:
+                    print("[WEB] hardware call error:", e)
+
+            self._json(200, button_states.copy())
+            return
+
+        if path == "/feedback":
+            if REAL:
+                try:
+                    fb = data.get_all_feedback()
+                except Exception:
+                    fb = simulated_feedback()
+            else:
+                fb = simulated_feedback()
+            # normalize keys
+            resp = {
+                "pressure": fb.get("palm_pressure"),
+                "temperature": fb.get("temperature"),
+                "battery_percent": fb.get("battery_percent"),
+                "battery_voltage": fb.get("battery_voltage")
+            }
+            self._json(200, resp)
+            return
+
+        if path == "/status":
+            if REAL:
+                try:
+                    fb = data.get_all_feedback()
+                except Exception:
+                    fb = simulated_feedback()
+            else:
+                fb = simulated_feedback()
+            out = {"mode": current_mode, "buttons": button_states.copy(), "feedback": fb}
+            self._json(200, out)
+            return
+
+        self.send_error(404, "Not found")
+
+def run():
+    addr = ("0.0.0.0", 8080)
+    print(f"[WEB] NeoArm webserver running on http://{addr[0]}:{addr[1]}")
+    HTTPServer(addr, Handler).serve_forever()
+
+if __name__ == "__main__":
+    run()
