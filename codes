@@ -1,174 +1,112 @@
 #!/usr/bin/env python3
 """
-main.py  -- NeoArm controller (starts sensors, hardware, webserver)
-Run inside your venv: python3 main.py
+hardware.py  -- servo + grip logic (uses pigpio instance attached by main.py)
+Do NOT create a pigpio instance here. main.py will call attach_pigpio(pi).
 """
 
 import time
-import threading
-import RPi.GPIO as GPIO
-import pigpio
-import os
+import data  # uses INA219 + ADS1115
 
-import data
-import hardware
-import webserver
+# pins for fingers (BCM)
+PIN_THUMB = 22
+PIN_IM = 18
+PIN_RP = 17
 
-# -------------------------
-# PIN DEFINITIONS
-# -------------------------
-PIN_WRIST = 23
-PIN_ELBOW = 24
-PIN_PUSH = 27  # GND -> Button -> GPIO27
+MAX_ANGLE = 180
+STEP = 3
+STEP_DELAY = 0.012  # faster sweep
+GRIP_THRESHOLD = 150  # mA threshold (tweak as needed)
 
-# -------------------------
-# GPIO INIT
-# -------------------------
-GPIO.setmode(GPIO.BCM)
-GPIO.setwarnings(False)
+# pigpio instance will be attached by main.py
+pi = None
 
-GPIO.setup(PIN_PUSH, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-
-# remove any stale detect
-try:
-    GPIO.remove_event_detect(PIN_PUSH)
-except Exception:
-    pass
-
-# -------------------------
-# pigpio INIT (single instance)
-# -------------------------
-pi = pigpio.pi()
-if not pi.connected:
-    print("[MAIN] ERROR: pigpio daemon not available. Start `sudo pigpiod` first.")
-else:
-    print("[MAIN] pigpio connected.")
-
-# attach single pigpio instance to hardware module
-hardware.attach_pigpio(pi)
-
-# -------------------------
-# MODE STATE
-# -------------------------
-current_mode = "button"
-push_state = False
+def attach_pigpio(pi_instance):
+    """Attach the pigpio instance created by main.py"""
+    global pi
+    pi = pi_instance
+    if pi is None:
+        print("[HARDWARE] pigpio not attached (pi is None)")
+    else:
+        print("[HARDWARE] pigpio attached")
 
 def set_mode(m):
-    global current_mode
-    current_mode = m
-    print(f"[MODE] Changed to: {m}")
-    # inform hardware (optional)
-    try:
-        hardware.set_mode(m)
-    except Exception:
-        pass
+    """Optional hook - webserver/main call this to log mode in hardware"""
+    print(f"[HARDWARE] Mode set to: {m}")
 
-# -------------------------
-# PUSH BUTTON HANDLER
-# -------------------------
-def _handle_push(channel):
-    global push_state
-    # only respond in button mode
-    if current_mode != "button":
-        print("[BTN] Press ignored (not in button mode)")
+def _write_servo_pulse(pin, angle):
+    """Write servo pulse if pi attached"""
+    if pi is None:
+        print(f"[HARDWARE] Warning: pigpio not attached. Cannot move servo {pin}")
         return
+    pulse = 500 + (angle / 180.0) * 2000
+    pi.set_servo_pulsewidth(pin, int(pulse))
 
-    # Debounce handled by bouncetime; level is falling (pressed to ground)
-    print("[BTN] Physical button pressed")
-    if not push_state:
-        print("[BTN] Closing all fingers (button)")
-        hardware.all_close()
-        push_state = True
-    else:
-        print("[BTN] Opening all fingers (button)")
-        hardware.all_open()
-        push_state = False
+def servo_off(pin):
+    if pi is not None:
+        pi.set_servo_pulsewidth(pin, 0)
 
-# register interrupt
-try:
-    GPIO.add_event_detect(PIN_PUSH, GPIO.FALLING, callback=_handle_push, bouncetime=200)
-    print("[MAIN] Push button interrupt enabled on GPIO27")
-except Exception as e:
-    print("[MAIN] ERROR enabling push button interrupt:", e)
-
-# -------------------------
-# JOINT THREAD (wrist + elbow)
-# -------------------------
-def joint_loop():
-    """Continuously set wrist/elbow from potentiometer percentages in data.py"""
-    while True:
+def get_avg_current():
+    vals = []
+    for _ in range(3):
         try:
-            wp = data.get_wrist_angle()
-            ep = data.get_elbow_angle()
-            # map percent (0..100) to pulse width
-            pw_wrist = 500 + (wp / 100.0) * 2000
-            pw_elbow = 500 + (ep / 100.0) * 2000
-            # write directly using pigpio instance (hardware.pi is same)
-            if hardware.pi is not None:
-                hardware.pi.set_servo_pulsewidth(PIN_WRIST, int(pw_wrist))
-                hardware.pi.set_servo_pulsewidth(PIN_ELBOW, int(pw_elbow))
-            print(f"[JOINT] Wrist={wp:.1f}%, Elbow={ep:.1f}%")
-        except Exception as e:
-            print("[JOINT] Error reading/writing joints:", e)
-        time.sleep(0.05)
+            vals.append(data.get_finger_current())
+        except Exception:
+            vals.append(0)
+        time.sleep(0.006)
+    return sum(vals) / len(vals)
 
-threading.Thread(target=joint_loop, daemon=True).start()
+def close_until_grip(pin):
+    """Close a single finger until current spike (returns True if stopped early)"""
+    print(f"[GRIP] Closing servo {pin}")
+    for ang in range(0, MAX_ANGLE + 1, STEP):
+        _write_servo_pulse(pin, ang)
+        time.sleep(STEP_DELAY)
+        curr = get_avg_current()
+        print(f"[GRIP] pin={pin} angle={ang} current={curr}")
+        if curr >= GRIP_THRESHOLD:
+            print(f"[GRIP] pin={pin} STOP at angle={ang} (current {curr} mA)")
+            return True
+    print(f"[GRIP] pin={pin} fully closed")
+    return False
 
-# -------------------------
-# FSR MODE THREAD
-# -------------------------
-def fsr_loop():
-    while True:
-        try:
-            if current_mode == "fsr":
-                pressed = data.get_trigger_fsr()
-                # if pressed -> close; else open
-                if pressed:
-                    print("[FSR] Trigger pressed -> close")
-                    hardware.all_close()
-                else:
-                    print("[FSR] Trigger released -> open")
-                    hardware.all_open()
-        except Exception as e:
-            print("[FSR] Exception:", e)
-        time.sleep(0.06)
+def open_finger(pin):
+    print(f"[OPEN] Opening servo {pin}")
+    for ang in range(MAX_ANGLE, -1, -STEP):
+        _write_servo_pulse(pin, ang)
+        time.sleep(STEP_DELAY)
+    # leave servo powered at 0 angle (optionally turn off)
+    # servo_off(pin)
 
-threading.Thread(target=fsr_loop, daemon=True).start()
+# group operations
+def all_close():
+    close_until_grip(PIN_THUMB)
+    close_until_grip(PIN_IM)
+    close_until_grip(PIN_RP)
 
-# -------------------------
-# START WEB SERVER (in same process so it can call hardware functions)
-# -------------------------
-def start_webserver_in_thread():
-    print("[MAIN] Launching webserver in-thread...")
-    t = threading.Thread(target=webserver.run, daemon=True)
-    t.start()
-    # give server a second to start
-    time.sleep(0.6)
-    print("[MAIN] Webserver should be up (http://<pi-ip>:8080)")
+def all_open():
+    open_finger(PIN_THUMB)
+    open_finger(PIN_IM)
+    open_finger(PIN_RP)
 
-# -------------------------
-# MAIN
-# -------------------------
-if __name__ == "__main__":
-    print("[MAIN] NeoArm started")
-    set_mode("button")
-    start_webserver_in_thread()
+# individual controls for webserver UI calls
+def thumb_on(): close_until_grip(PIN_THUMB)
+def thumb_off(): open_finger(PIN_THUMB)
 
+def im_on(): close_until_grip(PIN_IM)
+def im_off(): open_finger(PIN_IM)
+
+def rp_on(): close_until_grip(PIN_RP)
+def rp_off(): open_finger(PIN_RP)
+
+def all_on(): all_close()
+def all_off(): all_open()
+
+def shutdown():
+    """Turn off servos cleanly"""
+    print("[HARDWARE] shutdown: turning off servos")
     try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("[MAIN] Shutting down...")
-    finally:
-        print("[MAIN] cleanup: turning off servos, GPIO, pigpio")
-        hardware.shutdown()
-        try:
-            GPIO.cleanup()
-        except Exception:
-            pass
-        try:
-            if pi is not None:
-                pi.stop()
-        except Exception:
-            pass
-        print("[MAIN] Exit.")
+        servo_off(PIN_THUMB)
+        servo_off(PIN_IM)
+        servo_off(PIN_RP)
+    except Exception as e:
+        print("[HARDWARE] shutdown error:", e)
