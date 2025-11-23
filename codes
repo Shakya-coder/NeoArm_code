@@ -1,149 +1,160 @@
-# webserver.py
-# Minimal webserver that can call hardware functions directly
+# hardware.py
+# Servo + grip control. Uses data.get_* for INA219 readings and pigpio for servos.
 
-import json
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import unquote
 import time
+import threading
 
+# pigpio instance will be attached from main.py
+pi = None
+
+# servo pins (BCM)
+PIN_THUMB = 22
+PIN_IM = 18
+PIN_RP = 17
+
+# servo motion settings
+MAX_ANGLE = 180
+STEP = 4
+STEP_DELAY = 0.010   # speed - smaller = faster
+
+# threshold (mA)
+GRIP_THRESHOLD = 150.0
+
+# import data module lazily (main imports data anyway)
 try:
-    import hardware
     import data
-    REAL = True
-    print("[WEB] hardware + data modules imported (REAL mode).")
-except Exception as e:
-    hardware = None
+except Exception:
     data = None
-    REAL = False
-    print("[WEB] Running in SIMULATION MODE:", e)
 
-# state
-current_mode = "button"
-button_states = {"thumb": False, "im": False, "rp": False, "all": False}
+def attach_pigpio(p):
+    global pi
+    pi = p
+    print("[HARDWARE] pigpio instance attached")
 
-def set_all_buttons(state):
-    button_states["all"] = state
-    button_states["thumb"] = state
-    button_states["im"] = state
-    button_states["rp"] = state
+def _servo_write(pin, angle):
+    """Write angle (0..180) -> pulsewidth (500..2500 us)."""
+    if pi is None:
+        return
+    pulse = 500 + (angle / 180.0) * 2000
+    try:
+        pi.set_servo_pulsewidth(pin, int(pulse))
+    except Exception as e:
+        print("[HARDWARE] servo write error:", e)
 
-# simulation feedback
-def simulated_feedback():
-    t = int(time.time()) % 60
-    return {
-        "pressure": (t % 10) * 10,
-        "temperature": 25 + (t % 5),
-        "battery_percent": 80,
-        "battery_voltage": 11.7
-    }
+def servo_off(pin):
+    if pi is None:
+        return
+    try:
+        pi.set_servo_pulsewidth(pin, 0)
+    except Exception:
+        pass
 
-HTML = """<!doctype html>
-<html><head><meta charset="utf-8"><title>NeoArm</title></head><body>
-<h2>NeoArm Control</h2>
-<p>Use the endpoints: /mode/<fsr|button|wire>, /toggle/<thumb|im|rp|all>, /status, /feedback</p>
-</body></html>
-"""
+def _avg_thumb_current():
+    # average 3 samples from data.get_thumb_current()
+    vals = []
+    for _ in range(3):
+        try:
+            vals.append(data.get_thumb_current())
+        except Exception:
+            vals.append(0.0)
+        time.sleep(0.006)
+    return sum(vals) / len(vals)
 
-class Handler(BaseHTTPRequestHandler):
-    def _json(self, code, obj):
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(json.dumps(obj).encode())
+def _avg_finger_current():
+    # average 3 samples from data.get_finger_current()
+    vals = []
+    for _ in range(3):
+        try:
+            vals.append(data.get_finger_current())
+        except Exception:
+            vals.append(0.0)
+        time.sleep(0.006)
+    return sum(vals) / len(vals)
 
-    def _text(self, code, txt):
-        self.send_response(code)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(txt.encode())
+# ---------- finger control ----------
 
-    def do_GET(self):
-        global current_mode, button_states
-        path = unquote(self.path)
+def close_thumb_until_grip():
+    """Close thumb servo until thumb INA crosses threshold."""
+    print("[HARDWARE] Closing thumb until grip")
+    for ang in range(0, MAX_ANGLE + 1, STEP):
+        _servo_write(PIN_THUMB, ang)
+        time.sleep(STEP_DELAY)
+        curr = _avg_thumb_current()
+        print(f"[HARDWARE] Thumb angle={ang} current={curr} mA")
+        if curr >= GRIP_THRESHOLD:
+            print("[HARDWARE] Thumb grip detected - stopping")
+            return True
+    print("[HARDWARE] Thumb fully closed (no spike)")
+    return False
 
-        if path == "/" or path == "/index":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(HTML.encode())
-            return
+def open_thumb():
+    print("[HARDWARE] Opening thumb")
+    for ang in range(MAX_ANGLE, -1, -STEP):
+        _servo_write(PIN_THUMB, ang)
+        time.sleep(STEP_DELAY)
+    print("[HARDWARE] Thumb opened")
 
-        if path.startswith("/mode/"):
-            m = path.split("/mode/")[1]
-            if m in ("fsr","button","wire"):
-                current_mode = m
-                print(f"[WEB] Mode changed -> {m}")
-                if REAL and hasattr(hardware, "set_mode"):
-                    try:
-                        hardware.set_mode(m)
-                    except Exception:
-                        pass
-                self._text(200, "OK")
-            else:
-                self._text(400, "Invalid mode")
-            return
+def close_fingers_group_until_grip():
+    """
+    Close index+middle and ring+pinky together.
+    Uses group INA (finger INA) to detect a spike and stop both.
+    """
+    print("[HARDWARE] Closing finger group until grip")
+    for ang in range(0, MAX_ANGLE + 1, STEP):
+        _servo_write(PIN_IM, ang)
+        _servo_write(PIN_RP, ang)
+        time.sleep(STEP_DELAY)
+        curr = _avg_finger_current()
+        print(f"[HARDWARE] Group angle={ang} current={curr} mA")
+        if curr >= GRIP_THRESHOLD:
+            print("[HARDWARE] Group grip detected - stopping both")
+            return True
+    print("[HARDWARE] Group fully closed (no spike)")
+    return False
 
-        if path.startswith("/toggle/"):
-            name = path.split("/toggle/")[1]
-            if name not in button_states:
-                self._json(400, {"error":"invalid"})
-                return
-            new_state = not button_states[name]
-            button_states[name] = new_state
-            if name == "all":
-                set_all_buttons(new_state)
-            print(f"[WEB] toggle {name} -> {new_state}")
+def open_fingers_group():
+    print("[HARDWARE] Opening finger group")
+    for ang in range(MAX_ANGLE, -1, -STEP):
+        _servo_write(PIN_IM, ang)
+        _servo_write(PIN_RP, ang)
+        time.sleep(STEP_DELAY)
+    print("[HARDWARE] Finger group opened")
 
-            # call hardware
-            if REAL:
-                try:
-                    if name == "all":
-                        hardware.all_on() if new_state else hardware.all_off()
-                    else:
-                        func = getattr(hardware, f"{name}_{'on' if new_state else 'off'}")
-                        func()
-                except Exception as e:
-                    print("[WEB] hardware call error:", e)
+# high-level helpers (called by main/webserver)
+def thumb_on():
+    close_thumb_until_grip()
 
-            self._json(200, button_states.copy())
-            return
+def thumb_off():
+    open_thumb()
 
-        if path == "/feedback":
-            if REAL:
-                try:
-                    fb = data.get_all_feedback()
-                except Exception:
-                    fb = simulated_feedback()
-            else:
-                fb = simulated_feedback()
-            # normalize keys
-            resp = {
-                "pressure": fb.get("palm_pressure"),
-                "temperature": fb.get("temperature"),
-                "battery_percent": fb.get("battery_percent"),
-                "battery_voltage": fb.get("battery_voltage")
-            }
-            self._json(200, resp)
-            return
+def im_on():
+    close_fingers_group_until_grip()
 
-        if path == "/status":
-            if REAL:
-                try:
-                    fb = data.get_all_feedback()
-                except Exception:
-                    fb = simulated_feedback()
-            else:
-                fb = simulated_feedback()
-            out = {"mode": current_mode, "buttons": button_states.copy(), "feedback": fb}
-            self._json(200, out)
-            return
+def im_off():
+    open_fingers_group()
 
-        self.send_error(404, "Not found")
+def rp_on():
+    # same as im (group), keep for API compatibility
+    close_fingers_group_until_grip()
 
-def run():
-    addr = ("0.0.0.0", 8080)
-    print(f"[WEB] NeoArm webserver running on http://{addr[0]}:{addr[1]}")
-    HTTPServer(addr, Handler).serve_forever()
+def rp_off():
+    open_fingers_group()
 
-if __name__ == "__main__":
-    run()
+def all_on():
+    # Close thumb, then close group. They will stop on spikes.
+    close_thumb_until_grip()
+    close_fingers_group_until_grip()
+
+def all_off():
+    open_thumb()
+    open_fingers_group()
+
+# utility shutdown
+def shutdown():
+    try:
+        servo_off(PIN_THUMB)
+        servo_off(PIN_IM)
+        servo_off(PIN_RP)
+    except Exception:
+        pass
+    print("[HARDWARE] shutdown complete")
