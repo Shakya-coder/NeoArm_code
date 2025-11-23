@@ -1,281 +1,231 @@
 #!/usr/bin/env python3
+# CLEAN & STABLE WEB SERVER FOR NEOARM
+
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import unquote
 import time
-import threading
-import subprocess
-import pigpio
-import RPi.GPIO as GPIO
 
-import data  # sensor module
-
-import board
-import busio
-from adafruit_ssd1306 import SSD1306_I2C
-from PIL import Image, ImageDraw, ImageFont
-
-
-REAL = True
-
-# ============================================================
-# GPIO DEFINITIONS
-# ============================================================
-
-PIN_THUMB = 22
-PIN_IM = 18
-PIN_RP = 17
-
-PIN_WRIST = 23
-PIN_ELBOW = 24
-
-PIN_PUSH = 27        # push button → GND
-
-MAX_ANGLE = 180
-STEP = 3
-STEP_DELAY = 0.015
-
-GRIP_THRESHOLD = 150   # mA current stop
+# --------------------------------------------
+# IMPORT HARDWARE MODULE
+# --------------------------------------------
+try:
+    import hardware      # <-- The real control functions
+    import data
+    REAL = True
+    print("[WEB] Hardware + Data modules loaded")
+except Exception as e:
+    REAL = False
+    print("[WEB] Running in SIMULATION MODE:", e)
 
 
-# ============================================================
-# pigpio initialization FIRST
-# ============================================================
-pi = pigpio.pi()
-if not pi.connected:
-    print("[ERR] pigpio failed to start")
-else:
-    print("[MAIN] pigpio connected.")
-
-
-# ============================================================
-# OLED INIT
-# ============================================================
-
-i2c = busio.I2C(board.SCL, board.SDA)
-oled = SSD1306_I2C(128, 64, i2c)
-
-oled.fill(0)
-oled.show()
-
-font = ImageFont.load_default()
-
-
-def update_oled():
-    """OLED feedback display"""
-    try:
-        temp = data.get_temperature()
-        pressure = data.get_palm_pressure()
-        bv, bp = data.get_battery_level()
-    except:
-        temp, pressure, bv, bp = 0, 0, 0, 0
-
-    img = Image.new("1", (128, 64))
-    draw = ImageDraw.Draw(img)
-
-    draw.text((0, 0), "NeoArm Status", font=font, fill=255)
-    draw.text((0, 16), f"Temp: {temp:.1f} C", font=font, fill=255)
-    draw.text((0, 28), f"Palm: {pressure:.1f}%", font=font, fill=255)
-    draw.text((0, 40), f"Batt: {bp:.0f}% ({bv:.2f}V)", font=font, fill=255)
-
-    oled.image(img)
-    oled.show()
-
-
-def oled_loop():
-    while True:
-        update_oled()
-        time.sleep(0.5)
-
-
-threading.Thread(target=oled_loop, daemon=True).start()
-
-
-# ============================================================
-# SERVO CONTROL
-# ============================================================
-
-def servo_write(pin, angle):
-    pulse = 500 + (angle / 180.0) * 2000
-    pi.set_servo_pulsewidth(pin, pulse)
-
-
-def servo_off(pin):
-    pi.set_servo_pulsewidth(pin, 0)
-
-
-def get_avg_current():
-    vals = []
-    for _ in range(3):
-        try:
-            vals.append(data.get_finger_current())
-        except:
-            vals.append(0)
-        time.sleep(0.008)
-    return sum(vals) / len(vals)
-
-
-def close_until_grip(pin):
-    """Stop early when object detected via current spike"""
-    print(f"[SERVO] Closing pin {pin}")
-
-    for ang in range(0, MAX_ANGLE + 1, STEP):
-        servo_write(pin, ang)
-        time.sleep(STEP_DELAY)
-
-        curr = get_avg_current()
-        print(f"[CURR] {curr} mA")
-
-        if curr >= GRIP_THRESHOLD:
-            print(f"[GRIP] Stopped at {ang}°, current={curr}")
-            return True
-
-    print(f"[SERVO] Fully closed pin {pin}")
-    return False
-
-
-def open_finger(pin):
-    print(f"[SERVO] Opening pin {pin}")
-    for ang in range(MAX_ANGLE, -1, -STEP):
-        servo_write(pin, ang)
-        time.sleep(STEP_DELAY)
-
-
-# ============================================================
-# GROUP CONTROL
-# ============================================================
-
-def all_close():
-    print("[ACTION] Closing ALL fingers")
-    close_until_grip(PIN_THUMB)
-    close_until_grip(PIN_IM)
-    close_until_grip(PIN_RP)
-
-
-def all_open():
-    print("[ACTION] Opening ALL fingers")
-    open_finger(PIN_THUMB)
-    open_finger(PIN_IM)
-    open_finger(PIN_RP)
-
-
-# Used by wireless mode
-def thumb_on(): close_until_grip(PIN_THUMB)
-def thumb_off(): open_finger(PIN_THUMB)
-
-def im_on(): close_until_grip(PIN_IM)
-def im_off(): open_finger(PIN_IM)
-
-def rp_on(): close_until_grip(PIN_RP)
-def rp_off(): open_finger(PIN_RP)
-
-def all_on(): all_close()
-def all_off(): all_open()
-
-
-# ============================================================
-# MODE MANAGEMENT
-# ============================================================
-
+# --------------------------------------------
+# INTERNAL STATE
+# --------------------------------------------
 current_mode = "button"
-push_state = False
+
+button_states = {
+    "thumb": False,
+    "im": False,
+    "rp": False,
+    "all": False
+}
+
+def set_all_fingers(state: bool):
+    button_states["all"] = state
+    button_states["thumb"] = state
+    button_states["im"] = state
+    button_states["rp"] = state
 
 
-def set_mode(m):
-    global current_mode
-    current_mode = m
-    print(f"[MODE] Changed to: {m}")
+# --------------------------------------------
+# SIMULATION FEEDBACK IF HARDWARE MISSING
+# --------------------------------------------
+def simulated_feedback():
+    t = time.time() % 60
+    return {
+        "pressure": int((t % 10) * 10),
+        "temperature": 25 + int((t % 5)),
+        "battery_percent": 80,
+        "battery_voltage": 11.7
+    }
 
 
-# ============================================================
-# PUSH BUTTON — pigpio interrupt
-# ============================================================
+# --------------------------------------------
+# THE WEBPAGE (NO UTF ERRORS)
+# --------------------------------------------
+HTML = """
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>NeoArm Control Panel</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body { background:#f2f3f7; font-family:Arial; }
+.container { padding:15px; max-width:800px; margin:auto; }
+.card { background:#fff; padding:15px; border-radius:10px; margin-bottom:12px; box-shadow:0 4px 10px rgba(0,0,0,0.06);}
+.btn { padding:10px 18px; border-radius:8px; border:1px solid #888; cursor:pointer; }
+.btn.on { background:#2ecc71; color:#fff; border-color:#27ae60; }
+.mode-btn { padding:10px 14px; margin-right:8px; border-radius:8px; cursor:pointer; border:1px solid #777;}
+.mode-btn.active { background:#2ecc71; color:white; }
+</style>
+</head>
+<body>
 
-def handle_push(gpio):
-    global push_state
+<div class="container">
 
-    if current_mode != "button":
-        print("[BTN] Ignored (not in button mode)")
-        return
+<h2>Mode Selection</h2>
+<div class="card">
+<button class="mode-btn" onclick="setMode('fsr')" id="m_fsr">EMG</button>
+<button class="mode-btn" onclick="setMode('button')" id="m_button">Push Button</button>
+<button class="mode-btn" onclick="setMode('wire')" id="m_wire">Wireless</button>
+</div>
 
-    print("[BTN] Button pressed")
+<h2>Finger Control</h2>
+<div class="card">
+<button id="btn_thumb" class="btn" onclick="toggle('thumb')">Thumb</button>
+<button id="btn_im" class="btn" onclick="toggle('im')">Index+Middle</button>
+<button id="btn_rp" class="btn" onclick="toggle('rp')">Ring+Pinky</button>
+<button id="btn_all" class="btn" onclick="toggle('all')">All</button>
+</div>
 
-    if not push_state:
-        print("[BTN] Closing fingers")
-        all_close()
-        push_state = True
-    else:
-        print("[BTN] Opening fingers")
-        all_open()
-        push_state = False
+<h2>Feedback</h2>
+<div class="card">
+<p>Pressure: <span id="fb_p">--</span>%</p>
+<p>Temperature: <span id="fb_t">--</span>C</p>
+<p>Battery: <span id="fb_bp">--</span>% (<span id="fb_bv">--</span>V)</p>
+</div>
+
+</div>
+
+<script>
+
+function api(path){
+    return fetch(path, {cache:"no-store"}).then(r => r.json());
+}
+
+function setMode(m){
+    api("/mode/" + m);
+}
+
+function toggle(name){
+    api("/toggle/" + name);
+}
+
+setInterval(() => {
+    api("/status").then(d => {
+        document.getElementById("fb_p").innerText = d.feedback.pressure;
+        document.getElementById("fb_t").innerText = d.feedback.temperature;
+        document.getElementById("fb_bp").innerText = d.feedback.battery_percent;
+        document.getElementById("fb_bv").innerText = d.feedback.battery_voltage;
+
+        let mode = d.mode;
+        document.getElementById("m_fsr").classList.toggle("active", mode==="fsr");
+        document.getElementById("m_button").classList.toggle("active", mode==="button");
+        document.getElementById("m_wire").classList.toggle("active", mode==="wire");
+
+        ["thumb","im","rp","all"].forEach(n => {
+            let el = document.getElementById("btn_" + n);
+            el.classList.toggle("on", d.buttons[n]);
+        });
+    });
+}, 1000);
+
+</script>
+
+</body>
+</html>
+"""
 
 
-# configure pin
-pi.set_mode(PIN_PUSH, pigpio.INPUT)
-pi.set_pull_up_down(PIN_PUSH, pigpio.PUD_UP)
+# --------------------------------------------
+# REQUEST HANDLER
+# --------------------------------------------
+class Handler(BaseHTTPRequestHandler):
 
-# register callback
-btn_cb = pi.callback(PIN_PUSH, pigpio.FALLING_EDGE, handle_push)
-print("[MAIN] Push button interrupt OK (pigpio)")
+    def _json(self, code, obj):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(obj).encode())
 
+    def _html(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(HTML.encode())
 
-# ============================================================
-# WRIST + ELBOW THREAD
-# ============================================================
+    def do_GET(self):
+        global current_mode, button_states
 
-def joint_loop():
-    while True:
-        wp = data.get_wrist_angle()
-        ep = data.get_elbow_angle()
+        path = unquote(self.path)
 
-        print(f"[JOINT] Wrist={wp}%, Elbow={ep}%")
+        # ROOT PAGE
+        if path == "/" or path == "/index":
+            return self._html()
 
-        servo_write(PIN_WRIST, int((wp / 100) * 180))
-        servo_write(PIN_ELBOW, int((ep / 100) * 180))
+        # MODE CHANGE
+        if path.startswith("/mode/"):
+            mode = path.split("/mode/")[1]
+            current_mode = mode
+            print(f"[WEB] Mode changed → {mode}")
 
-        time.sleep(0.05)
+            if REAL:
+                try:
+                    hardware.set_mode(mode)
+                except:
+                    pass
 
+            return self._json(200, {"mode": mode})
 
-threading.Thread(target=joint_loop, daemon=True).start()
+        # FINGER TOGGLE
+        if path.startswith("/toggle/"):
+            name = path.split("/toggle/")[1]
+            if name not in button_states:
+                return self._json(400, {"error": "Invalid finger"})
 
+            new_state = not button_states[name]
+            button_states[name] = new_state
 
-# ============================================================
-# FSR THREAD
-# ============================================================
+            print(f"[WEB] Finger {name} → {new_state}")
 
-def fsr_loop():
-    while True:
-        if current_mode == "fsr":
-            if data.get_trigger_fsr():
-                print("[FSR] GRIP detected → closing")
-                all_close()
+            if REAL:
+                try:
+                    if name == "all":
+                        hardware.all_close() if new_state else hardware.all_open()
+                    else:
+                        func = getattr(hardware, f"{name}_{'on' if new_state else 'off'}")
+                        func()
+                except Exception as e:
+                    print("[WEB] ERROR calling hardware:", e)
+
+            return self._json(200, button_states)
+
+        # STATUS (UI refresh)
+        if path == "/status":
+            if REAL:
+                fb = data.get_all_feedback()
             else:
-                print("[FSR] Released → opening")
-                all_open()
-        time.sleep(0.05)
+                fb = simulated_feedback()
+
+            return self._json(200, {
+                "mode": current_mode,
+                "buttons": button_states,
+                "feedback": fb
+            })
+
+        self.send_error(404)
 
 
-threading.Thread(target=fsr_loop, daemon=True).start()
+# --------------------------------------------
+# START SERVER
+# --------------------------------------------
+def run():
+    addr = ("0.0.0.0", 8080)
+    print("[WEB] Listening on http://0.0.0.0:8080")
+    HTTPServer(addr, Handler).serve_forever()
 
-
-# ============================================================
-# MAIN LOOP
-# ============================================================
 
 if __name__ == "__main__":
-    print("[MAIN] NeoArm started")
-    set_mode(current_mode)
-
-    print("[MAIN] Launching webserver…")
-    subprocess.Popen(["python3", "/home/rohit/NeoArm/webserver.py"])
-
-    try:
-        while True:
-            time.sleep(1)
-
-    except KeyboardInterrupt:
-        print("[MAIN] Shutting down…")
-        servo_off(PIN_THUMB)
-        servo_off(PIN_IM)
-        servo_off(PIN_RP)
-        servo_off(PIN_WRIST)
-        servo_off(PIN_ELBOW)
-        pi.stop()
-        print("[MAIN] Clean exit.")
+    run()
